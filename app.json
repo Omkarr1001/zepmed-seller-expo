@@ -1,0 +1,39 @@
+{
+  "expo": {
+    "name": "ZepMed Seller",
+    "slug": "zepmed-seller",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/ic_launcher.png",
+    "userInterfaceStyle": "light",
+    "scheme": "zepmedseller",
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.zepmed.seller"
+    },
+    "android": {
+      "package": "com.zepmed.seller",
+      "versionCode": 1,
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/ic_launcher.png",
+        "backgroundColor": "#FAF9F5"
+      },
+      "permissions": [
+        "INTERNET",
+        "ACCESS_NETWORK_STATE",
+        "VIBRATE",
+        "POST_NOTIFICATIONS",
+        "BLUETOOTH",
+        "BLUETOOTH_ADMIN",
+        "BLUETOOTH_CONNECT"
+      ]
+    },
+    "extra": {
+      "phpApiBase": "https://api.zepmed.org/api/v1",
+      "authApiBase": "https://auth.zepmed.org/api/v1"
+    }
+  }
+}

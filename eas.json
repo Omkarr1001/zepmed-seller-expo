@@ -1,0 +1,21 @@
+{
+  "cli": {
+    "version": ">= 13.4.2",
+    "appVersionSource": "local"
+  },
+  "build": {
+    "preview": {
+      "android": {
+        "buildType": "apk"
+      }
+    },
+    "production": {
+      "android": {
+        "buildType": "app-bundle"
+      }
+    }
+  },
+  "submit": {
+    "production": {}
+  }
+}
