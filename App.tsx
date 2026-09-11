@@ -8,8 +8,10 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   Alert,
+  Animated,
   AppState,
   BackHandler,
+  Easing,
   Image,
   Modal,
   Platform,
@@ -28,6 +30,7 @@ import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-cont
 
 const API = {
   phpBaseUrl: 'https://api.zepmed.org/api/v1',
+  phpFallbackBaseUrl: 'https://zepmed.org/api/v1',
   authBaseUrl: 'https://auth.zepmed.org/api/v1',
   authFallbackBaseUrl: 'https://api.zepmed.org/auth-api/v1',
   authLegacyBaseUrl: 'https://zepmed.org/auth-api/v1',
@@ -60,6 +63,7 @@ const SESSION_KEY = 'zepmed:seller:session';
 const PREF_KEY = 'zepmed:seller:prefs';
 const PENDING_NOTIFICATIONS_KEY = 'zepmed:seller:pending-notifications';
 const ORDER_POLL_TASK = 'zepmed-seller-order-poll';
+const ORDER_NOTIFICATION_CATEGORY = 'zepmed-seller-order-actions';
 
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
@@ -211,12 +215,12 @@ type DailySalesReport = {
   }> | null;
 };
 
-type TabKey = 'home' | 'orders' | 'catalog' | 'wholesale' | 'more';
+type TabKey = 'home' | 'orders' | 'catalog' | 'stock' | 'more';
 type AuthTab = 'password' | 'otp' | 'register';
 type OrderFilter = 'all' | 'pending' | 'rx' | 'preparing' | 'ready' | 'delivered';
 type DashboardTarget = 'orders' | 'pending' | 'revenue' | 'delivered';
 type MoreModule = 'pharmacy' | 'settings' | 'notifications' | 'rx' | 'stock' | 'virtual' | 'payouts' | null;
-type CatalogSuggestion = { product_id: number; name: string; price?: number | null; seller_stock?: number | null };
+type CatalogSuggestion = { id?: number; product_id?: number; name: string; price?: number | null; seller_stock?: number | null };
 type RxMedicineRow = { product_id?: number; name: string; qty: string; price: string };
 type SellerSettings = {
   settings?: {
@@ -405,7 +409,7 @@ async function request<T>(
 
   const bases = options.auth
     ? [API.authBaseUrl, API.authFallbackBaseUrl, API.authLegacyBaseUrl]
-    : [API.phpBaseUrl];
+    : [API.phpBaseUrl, API.phpFallbackBaseUrl];
   let lastError: unknown;
 
   for (let idx = 0; idx < bases.length; idx += 1) {
@@ -422,7 +426,7 @@ async function request<T>(
       });
     } catch (err) {
       lastError = err;
-      if (options.auth && idx < bases.length - 1) continue;
+      if (idx < bases.length - 1) continue;
       throw err;
     } finally {
       clearTimeout(timeout);
@@ -442,7 +446,7 @@ async function request<T>(
 
     const err = new Error(json.message || `Server error (${response.status})`);
     lastError = err;
-    if (options.auth && [404, 502, 503, 504].includes(response.status) && idx < bases.length - 1) continue;
+    if ([404, 502, 503, 504].includes(response.status) && idx < bases.length - 1) continue;
     if (!options.auth && options.retry !== false && [502, 503, 504].includes(response.status)) {
       await delay(900);
       return request<T>(path, { ...options, retry: false });
@@ -477,6 +481,10 @@ async function ensureNotificationReady() {
       lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
     });
   }
+  await Notifications.setNotificationCategoryAsync(ORDER_NOTIFICATION_CATEGORY, [
+    { identifier: 'accept', buttonTitle: 'Accept', options: { opensAppToForeground: true } },
+    { identifier: 'open', buttonTitle: 'Open', options: { opensAppToForeground: true } },
+  ]).catch(() => undefined);
   const existing = await Notifications.getPermissionsAsync();
   if (!existing.granted) {
     const requested = await Notifications.requestPermissionsAsync();
@@ -496,6 +504,7 @@ async function schedulePendingOrderNotification(order: Order, existing: Record<s
       body: `${order.customer_name || 'Customer'} • ${money(order.total_amount)}. Tap to open and accept.`,
       sound: 'default',
       data: { orderId: order.id },
+      categoryIdentifier: ORDER_NOTIFICATION_CATEGORY,
       priority: Notifications.AndroidNotificationPriority.MAX,
     },
     trigger: { seconds: 20, repeats: true, channelId: 'order-alerts' } as Notifications.NotificationTriggerInput,
@@ -596,9 +605,9 @@ const sellerApi = {
   processOrder: (body: unknown) => request<Record<string, unknown>>('seller/orders/process', { body }),
   prescriptionFill: (body: unknown) => request<OrderDetail>('seller/orders/prescription-fill', { body }),
   orderAction: (orderId: number, action: string) => request<Record<string, unknown>>('seller/orders/action', { body: { order_id: orderId, action } }),
-  inventory: () => request<{ items?: InventoryItem[] | null }>('seller/inventory'),
+  inventory: (search = '') => request<{ items?: InventoryItem[] | null }>('seller/inventory', { query: { search, page: 1, limit: 100, status: 'all' } }),
   updateStock: (body: unknown) => request<Record<string, unknown>>('seller/inventory/update', { body }),
-  catalogSearch: (search: string) => request<{ items?: Array<{ product_id: number; name: string; price?: number | null; seller_stock?: number | null }> | null }>('seller/catalog/search', { query: { search, limit: 15 } }),
+  catalogSearch: (search: string) => request<{ items?: CatalogSuggestion[] | null }>('seller/catalog/search', { query: { search, limit: 30 } }),
   dailySalesReport: (from: string, to: string) => request<DailySalesReport>('seller/reports/daily-sales', { query: { from, to } }),
   orderSalesReport: (from: string, to: string) => request<DailySalesReport>('seller/reports/order-sales', { query: { from, to } }),
   rxOrdersReport: (from: string, to: string) => request<Record<string, unknown>>('seller/reports/rx-orders', { query: { from, to } }),
@@ -845,8 +854,6 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
   const refreshInFlight = useRef(false);
   const tabHistory = useRef<TabKey[]>([]);
 
-  const canWholesale = dash?.plan_features?.features?.includes('wholesale') || dash?.is_wholeseller === true;
-
   const goTab = useCallback((next: TabKey, filter?: OrderFilter) => {
     if (filter) setOrderFilter(filter);
     setTab((current) => {
@@ -890,13 +897,11 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
       setOrders(next);
       await syncPendingOrderNotifications(next);
 
-      if (tab === 'home' || tab === 'catalog') {
-        try {
-          const inv = await sellerApi.inventory();
-          setInventory(inv.data?.items ?? []);
-        } catch (err) {
-          if (!isAbortError(err) && !inventory.length) nextError = nextError || errorMessage(err);
-        }
+      try {
+        const inv = await sellerApi.inventory();
+        setInventory(inv.data?.items ?? []);
+      } catch (err) {
+        if (!isAbortError(err) && !inventory.length) nextError = nextError || errorMessage(err);
       }
       if (nextError) setError(nextError);
     } catch (err) {
@@ -917,7 +922,14 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
     registerOrderBackgroundTask().catch(() => undefined);
     const sub = Notifications.addNotificationResponseReceivedListener((response) => {
       const orderId = Number(response.notification.request.content.data?.orderId || 0);
-      if (orderId) openOrder(orderId);
+      const actionId = response.actionIdentifier;
+      if (orderId && actionId === 'accept') {
+        const order = orders.find((item) => item.id === orderId);
+        const code = order && isPrescription(order) ? 'rx_accept' : 'confirmed';
+        action(orderId, code).catch(() => openOrder(orderId));
+      } else if (orderId) {
+        openOrder(orderId);
+      }
     });
     const appSub = AppState.addEventListener('change', (state) => {
       if (state === 'active') refresh(true);
@@ -926,7 +938,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
       sub.remove();
       appSub.remove();
     };
-  }, [refresh]);
+  }, [orders, refresh]);
 
   useEffect(() => {
     const sub = BackHandler.addEventListener('hardwareBackPress', () => {
@@ -979,12 +991,13 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
   }
 
   async function toggleStoreOpen(nextOpen: boolean) {
+    const previous = dash?.is_open;
+    setDash((currentDash) => currentDash ? { ...currentDash, is_open: nextOpen } : currentDash);
     try {
-      const current = await sellerApi.settings().catch(() => ({ data: { settings: dash ? {} : undefined } as SellerSettings }));
-      await sellerApi.saveSettings({ ...(current.data?.settings ?? {}), is_open: nextOpen ? 1 : 0 });
-      setDash((currentDash) => currentDash ? { ...currentDash, is_open: nextOpen } : currentDash);
+      await sellerApi.saveSettings({ is_open: nextOpen ? 1 : 0 });
       await refresh(true);
     } catch (err) {
+      setDash((currentDash) => currentDash ? { ...currentDash, is_open: previous } : currentDash);
       Alert.alert('Store status', errorMessage(err));
     }
   }
@@ -1005,7 +1018,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
   return (
     <View style={[s.screen, { paddingTop: insets.top }]}>
       <Header
-        title={tab === 'home' ? 'ZepMed Seller' : tab[0].toUpperCase() + tab.slice(1)}
+        title={tab === 'home' ? 'ZepMed Seller' : tab === 'stock' ? 'Stock Management' : tab[0].toUpperCase() + tab.slice(1)}
         subtitle={[dash?.pharmacy?.name, dash?.pharmacy?.city].filter(Boolean).join(' • ') || 'Pharmacy'}
         onRefresh={() => refresh()}
       />
@@ -1014,11 +1027,11 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
         {error ? <Notice tone="error" title={error} /> : null}
         {tab === 'home' ? <HomeScreen dash={dash} orders={orders} onOpenOrder={openOrder} onAction={action} onDashboardTarget={openDashboardTarget} onStoreToggle={toggleStoreOpen} /> : null}
         {tab === 'orders' ? <OrdersScreen orders={orders} filter={orderFilter} onFilter={setOrderFilter} onOpenOrder={openOrder} onAction={action} /> : null}
-        {tab === 'catalog' ? <CatalogScreen items={inventory} onEdit={setEditItem} onWholesale={() => goTab('wholesale')} /> : null}
-        {tab === 'wholesale' ? <WholesaleScreen dash={dash} canWholesale={Boolean(canWholesale)} onRefresh={() => refresh(true)} /> : null}
+        {tab === 'catalog' ? <CatalogScreen items={inventory} onEdit={setEditItem} onStock={() => goTab('stock')} /> : null}
+        {tab === 'stock' ? <StockManagementScreen /> : null}
         {tab === 'more' ? <MoreScreen dash={dash} onReport={() => setShowReport(true)} onOpenModule={setMoreModule} onRefresh={() => refresh()} onLogout={onLogout} /> : null}
       </ScrollView>
-      <BottomTabs current={tab} setTab={goTab} pending={orders.filter((o) => pendingStatus(o.status)).length} showWholesale={Boolean(canWholesale)} />
+      <BottomTabs current={tab} setTab={goTab} pending={orders.filter((o) => pendingStatus(o.status)).length} />
       <StockEditModal item={editItem} onClose={() => setEditItem(null)} onSaved={() => { setEditItem(null); refresh(true); }} />
       <NewOrderPopup order={fresh} onClose={() => setFresh(null)} onOpen={() => { const order = fresh; setFresh(null); if (order) openOrder(order.id); }} />
     </View>
@@ -1072,6 +1085,12 @@ function HomeScreen({
           </View>
           <Text style={[s.storeToggleAction, { color: open ? C.green : C.red }]}>{open ? 'Close' : 'Open'}</Text>
         </TouchableOpacity>
+        <View style={s.summaryGrid}>
+          <SummaryTile label="Total Orders" value={String(dash.orders_total ?? 0)} onPress={() => onDashboardTarget('orders')} />
+          <SummaryTile label="Revenue" value={shortMoney(dash.revenue_total)} onPress={() => onDashboardTarget('revenue')} />
+          <SummaryTile label="Pending" value={String(dash.pending_dispatch ?? 0)} onPress={() => onDashboardTarget('pending')} />
+          <SummaryTile label="Delivered" value={String(dash.delivered_count ?? 0)} onPress={() => onDashboardTarget('delivered')} />
+        </View>
       </View>
       <View style={[s.infoCard, { backgroundColor: C.blueSoft }]}>
         <Text style={[s.infoTitle, { color: C.blue }]}>Global catalog synced</Text>
@@ -1136,7 +1155,7 @@ function OrdersScreen({
   );
 }
 
-function CatalogScreen({ items, onEdit, onWholesale }: { items: InventoryItem[]; onEdit: (item: InventoryItem) => void; onWholesale: () => void }) {
+function CatalogScreen({ items, onEdit, onStock }: { items: InventoryItem[]; onEdit: (item: InventoryItem) => void; onStock: () => void }) {
   const [query, setQuery] = useState('');
   const [lowOnly, setLowOnly] = useState(false);
   const lowCount = items.filter((i) => i.stock <= 10).length;
@@ -1154,7 +1173,7 @@ function CatalogScreen({ items, onEdit, onWholesale }: { items: InventoryItem[];
       <TouchableOpacity style={[s.smallChip, lowOnly && { backgroundColor: C.ink }]} onPress={() => setLowOnly(!lowOnly)}>
         <Text style={[s.smallChipText, lowOnly && { color: '#FFF' }]}>Low stock only</Text>
       </TouchableOpacity>
-      {lowCount ? <TouchableOpacity style={s.purchaseCta} onPress={onWholesale}><Text style={s.purchaseText}>Purchase from wholeseller</Text><Text style={s.purchaseArrow}>→</Text></TouchableOpacity> : null}
+      {lowCount ? <TouchableOpacity style={s.purchaseCta} onPress={onStock}><Text style={s.purchaseText}>Open Stock Management</Text><Text style={s.purchaseArrow}>→</Text></TouchableOpacity> : null}
       {filtered.map((item) => <ProductRow key={item.id} item={item} onPress={() => onEdit(item)} />)}
       {!filtered.length ? <Empty title="Catalog empty" body="Products appear after you confirm orders." /> : null}
     </>
@@ -1443,7 +1462,7 @@ function RxRequestsScreen() {
   const [selected, setSelected] = useState<RxRequest | null>(null);
   const [note, setNote] = useState('');
   const [search, setSearch] = useState('');
-  const [results, setResults] = useState<Array<{ product_id: number; name: string; price?: number | null }>>([]);
+  const [results, setResults] = useState<CatalogSuggestion[]>([]);
   const [cart, setCart] = useState<Array<{ product_id: number; name: string; quantity: number }>>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -1457,7 +1476,7 @@ function RxRequestsScreen() {
   async function searchCatalog(q: string) {
     setSearch(q);
     if (q.trim().length < 2) return setResults([]);
-    try { const res = await sellerApi.catalogSearch(q); setResults((res.data?.items ?? []).map((p) => ({ product_id: p.product_id, name: p.name, price: p.price }))); } catch { setResults([]); }
+    try { const res = await sellerApi.catalogSearch(q); setResults(res.data?.items ?? []); } catch { setResults([]); }
   }
   async function fillToCart() {
     if (!selected || !cart.length) return Alert.alert('Rx', 'Search and add at least one catalog medicine.');
@@ -1479,7 +1498,10 @@ function RxRequestsScreen() {
     <View style={s.card}><Text style={s.itemTitle}>{selected.customer_name || 'Customer'} Rx</Text><Text style={s.muted}>{selected.status || '-'} • {prettyDate(selected.created_at)}</Text>{selected.prescription_url ? <Image source={{ uri: mediaUrl(selected.prescription_url) }} style={s.rxImage} resizeMode="contain" /> : null}</View>
     <Field label="Message / seller notes" value={note} onChangeText={setNote} multiline />
     <SearchBox placeholder="Search medicine from catalog" value={search} onChangeText={searchCatalog} />
-    {results.slice(0, 6).map((p) => <MenuItem key={p.product_id} title={p.name} body={money(p.price)} onPress={() => { setCart((c) => c.some((x) => x.product_id === p.product_id) ? c : [...c, { product_id: p.product_id, name: p.name, quantity: 1 }]); setResults([]); setSearch(''); }} />)}
+    {results.slice(0, 6).map((p) => {
+      const productId = Number(p.product_id ?? p.id ?? 0);
+      return <MenuItem key={productId || p.name} title={p.name} body={`${money(p.price)} • ${p.seller_stock ?? 0} available`} onPress={() => { if (!productId) return; setCart((c) => c.some((x) => x.product_id === productId) ? c : [...c, { product_id: productId, name: p.name, quantity: 1 }]); setResults([]); setSearch(''); }} />;
+    })}
     {cart.map((c) => <View key={c.product_id} style={s.card}><View style={s.rowBetween}><Text style={s.itemTitle}>{c.name}</Text><TextInput style={s.qtyInput} value={String(c.quantity)} keyboardType="number-pad" onChangeText={(v) => setCart((list) => list.map((x) => x.product_id === c.product_id ? { ...x, quantity: Math.max(1, Number(v.replace(/\D/g, '') || 1)) } : x))} /></View></View>)}
     <Primary label="Send Medicines To Customer Cart" onPress={fillToCart} />
     <View style={s.inputRow}><Secondary label="Send Message" onPress={message} compact /><Danger label="Reject Rx" onPress={reject} compact /></View>
@@ -1617,8 +1639,9 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
   }
 
   function chooseRxProduct(index: number, product: CatalogSuggestion) {
+    const productId = Number(product.product_id ?? product.id ?? 0);
     updateRxRow(index, {
-      product_id: product.product_id,
+      product_id: productId || undefined,
       name: product.name,
       price: product.price != null ? String(product.price) : '',
     });
@@ -1706,7 +1729,7 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
               <View key={idx} style={s.card}>
                 <Field label="Medicine name" value={row.name} onChangeText={(v) => searchRxCatalog(idx, v)} />
                 {(rxSuggest[idx] ?? []).slice(0, 5).map((product) => (
-                  <TouchableOpacity key={product.product_id} style={s.suggestionRow} onPress={() => chooseRxProduct(idx, product)}>
+                  <TouchableOpacity key={product.product_id ?? product.id ?? product.name} style={s.suggestionRow} onPress={() => chooseRxProduct(idx, product)}>
                     <View style={{ flex: 1 }}>
                       <Text style={s.itemTitle}>{product.name}</Text>
                       <Text style={s.muted}>{product.seller_stock ?? 0} available</Text>
@@ -1714,6 +1737,7 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
                     <Text style={s.itemPrice}>{money(product.price)}</Text>
                   </TouchableOpacity>
                 ))}
+                {row.name.trim().length >= 2 && !(rxSuggest[idx] ?? []).length ? <Text style={s.muted}>No catalog match yet. Check spelling or add another medicine name.</Text> : null}
                 <View style={s.inputRow}>
                   <Field label="Qty" value={row.qty} onChangeText={(v) => updateRxRow(idx, { qty: v.replace(/\D/g, '') })} keyboardType="number-pad" compact />
                   <Field label="Price" value={row.price} onChangeText={(v) => updateRxRow(idx, { price: v.replace(/[^0-9.]/g, '') })} keyboardType="decimal-pad" compact />
@@ -1990,19 +2014,39 @@ function WholesaleOrderCard({ order, action }: { order: WholesaleOrder; action?:
   );
 }
 
-function BottomTabs({ current, setTab, pending, showWholesale }: { current: TabKey; setTab: (tab: TabKey) => void; pending: number; showWholesale: boolean }) {
-  const tabs: Array<[TabKey, string, string]> = [['home', 'Home', '⌂'], ['orders', 'Orders', '▣'], ['catalog', 'Catalog', '▦']];
-  if (showWholesale) tabs.push(['wholesale', 'Wholesale', '◇']);
+function BottomTabs({ current, setTab, pending }: { current: TabKey; setTab: (tab: TabKey) => void; pending: number }) {
+  const tabs: Array<[TabKey, string, string]> = [['home', 'Home', '⌂'], ['orders', 'Orders', '▣'], ['catalog', 'Catalog', '▦'], ['stock', 'Stock', '+']];
   tabs.push(['more', 'More', '•••']);
   return (
     <View style={s.tabs}>
       {tabs.map(([key, label, icon]) => (
         <TouchableOpacity key={key} style={[s.tab, current === key && s.tabActive]} onPress={() => setTab(key)}>
-          <View><Text style={[s.tabIcon, current === key && s.tabTextActive]}>{icon}</Text>{key === 'orders' && pending > 0 ? <Text style={s.badge}>{pending > 9 ? '9+' : pending}</Text> : null}</View>
+          <AnimatedTabLogo icon={icon} active={current === key} badge={key === 'orders' && pending > 0 ? (pending > 9 ? '9+' : String(pending)) : undefined} />
           <Text style={[s.tabLabel, current === key && s.tabTextActive]}>{label}</Text>
         </TouchableOpacity>
       ))}
     </View>
+  );
+}
+
+function AnimatedTabLogo({ icon, active, badge }: { icon: string; active: boolean; badge?: string }) {
+  const progress = useRef(new Animated.Value(active ? 1 : 0)).current;
+  useEffect(() => {
+    Animated.timing(progress, {
+      toValue: active ? 1 : 0,
+      duration: 220,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: true,
+    }).start();
+  }, [active, progress]);
+  const scale = progress.interpolate({ inputRange: [0, 1], outputRange: [1, 1.16] });
+  const translateY = progress.interpolate({ inputRange: [0, 1], outputRange: [0, -2] });
+  const opacity = progress.interpolate({ inputRange: [0, 1], outputRange: [0.72, 1] });
+  return (
+    <Animated.View style={[s.tabLogo, active && s.tabLogoActive, { opacity, transform: [{ translateY }, { scale }] }]}>
+      <Text style={[s.tabIcon, active && s.tabTextActive]}>{icon}</Text>
+      {badge ? <Text style={s.badge}>{badge}</Text> : null}
+    </Animated.View>
   );
 }
 
@@ -2087,6 +2131,15 @@ function Kpi({ label, value, tone, onPress }: { label: string; value: string; to
       <Text style={[s.kpiLabel, { color: palette[1] }]}>{label}</Text>
       <Text style={s.kpiValue}>{value}</Text>
       <Text style={[s.kpiArrow, { color: palette[1] }]}>›</Text>
+    </TouchableOpacity>
+  );
+}
+
+function SummaryTile({ label, value, onPress }: { label: string; value: string; onPress: () => void }) {
+  return (
+    <TouchableOpacity style={s.summaryTile} activeOpacity={0.82} onPress={onPress}>
+      <Text style={s.summaryLabel}>{label}</Text>
+      <Text style={s.summaryValue}>{value}</Text>
     </TouchableOpacity>
   );
 }
@@ -2185,6 +2238,10 @@ const s = StyleSheet.create({
   storeToggleTitle: { fontSize: 16, fontWeight: '900' },
   storeToggleBody: { fontSize: 12, marginTop: 4 },
   storeToggleAction: { fontSize: 14, fontWeight: '900' },
+  summaryGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
+  summaryTile: { width: '47.9%', minHeight: 70, borderRadius: 14, borderWidth: 1, borderColor: C.line, backgroundColor: C.surface, padding: 12, justifyContent: 'center' },
+  summaryLabel: { color: C.muted, fontSize: 11, fontWeight: '900' },
+  summaryValue: { color: C.ink, fontSize: 21, fontWeight: '900', marginTop: 5 },
   infoCard: { borderRadius: 16, padding: 16 },
   infoTitle: { fontWeight: '900', fontSize: 15 },
   infoText: { marginTop: 6, fontSize: 13 },
@@ -2265,10 +2322,12 @@ const s = StyleSheet.create({
   tabs: { position: 'absolute', left: 0, right: 0, bottom: 0, height: 80, backgroundColor: '#FFF', borderTopWidth: 1, borderTopColor: C.line, flexDirection: 'row', justifyContent: 'space-around', paddingHorizontal: 10, paddingTop: 8 },
   tab: { minWidth: 64, height: 58, borderRadius: 18, alignItems: 'center', justifyContent: 'center' },
   tabActive: { backgroundColor: C.beige },
-  tabIcon: { color: C.muted, fontSize: 22, fontWeight: '900', textAlign: 'center' },
+  tabLogo: { width: 34, height: 30, borderRadius: 14, alignItems: 'center', justifyContent: 'center', backgroundColor: 'transparent' },
+  tabLogoActive: { backgroundColor: '#FFF', shadowColor: C.orange, shadowOpacity: 0.22, shadowRadius: 8, shadowOffset: { width: 0, height: 4 }, elevation: 3 },
+  tabIcon: { color: C.muted, fontSize: 21, fontWeight: '900', textAlign: 'center', lineHeight: 24 },
   tabLabel: { color: C.muted, fontSize: 11, fontWeight: '700', marginTop: 2 },
   tabTextActive: { color: C.orange },
-  badge: { position: 'absolute', right: -14, top: -8, minWidth: 20, height: 20, borderRadius: 10, backgroundColor: '#A34641', color: '#FFF', fontWeight: '900', textAlign: 'center', overflow: 'hidden', fontSize: 11, lineHeight: 20 },
+  badge: { position: 'absolute', right: -10, top: -7, minWidth: 20, height: 20, borderRadius: 10, backgroundColor: '#A34641', color: '#FFF', fontWeight: '900', textAlign: 'center', overflow: 'hidden', fontSize: 11, lineHeight: 20 },
   modalShade: { flex: 1, backgroundColor: 'rgba(0,0,0,0.36)', justifyContent: 'center', padding: 22 },
   modalCard: { backgroundColor: C.bg, borderRadius: 22, padding: 20, gap: 12 },
   newOrderModal: { backgroundColor: C.bg, borderRadius: 24, padding: 22, gap: 12, alignItems: 'center' },
