@@ -40,6 +40,7 @@ const C = {
   muted: '#72736F',
   line: '#E5DED5',
   orange: '#E2632E',
+  redAccent: '#EF4F3E',
   orangeDark: '#C84E21',
   orangeSoft: '#F8E1D4',
   beige: '#F5EFE8',
@@ -100,6 +101,8 @@ type DashboardData = {
   delivered_count?: number;
   inventory_low_stock?: number;
   is_wholeseller?: boolean | null;
+  is_open?: boolean | number | null;
+  auto_active_now?: boolean | number | null;
   pharmacy?: PharmacyInfo | null;
   subscription?: SubscriptionInfo | null;
   plan_features?: PlanFeatures | null;
@@ -118,6 +121,7 @@ type Order = {
   fulfillment_status?: string | null;
   order_type?: string | null;
   routed_via?: string | null;
+  seller_confirmed_at?: string | null;
   is_virtual_shop_order?: boolean | null;
   customer_shop_mode?: string | null;
   preferred_pharmacy_name?: string | null;
@@ -212,6 +216,8 @@ type AuthTab = 'password' | 'otp' | 'register';
 type OrderFilter = 'all' | 'pending' | 'rx' | 'preparing' | 'ready' | 'delivered';
 type DashboardTarget = 'orders' | 'pending' | 'revenue' | 'delivered';
 type MoreModule = 'pharmacy' | 'settings' | 'notifications' | 'rx' | 'stock' | 'virtual' | 'payouts' | null;
+type CatalogSuggestion = { product_id: number; name: string; price?: number | null; seller_stock?: number | null };
+type RxMedicineRow = { product_id?: number; name: string; qty: string; price: string };
 type SellerSettings = {
   settings?: {
     store?: { auto_mode?: boolean | number; open_time?: string; close_time?: string; days?: number[] };
@@ -295,6 +301,14 @@ function quickActions(status: string) {
   return [];
 }
 
+function orderCardActions(order: Order) {
+  if (pendingStatus(order.status)) {
+    if (isPrescription(order)) return order.seller_confirmed_at ? [] : [{ code: 'rx_accept', label: 'Accept' }];
+    return [{ code: 'confirmed', label: 'Accept' }];
+  }
+  return quickActions(order.status);
+}
+
 function mediaUrl(path?: string | null) {
   if (!path) return undefined;
   if (/^https?:\/\//i.test(path)) return path;
@@ -322,11 +336,16 @@ function expiryFromJwt(token?: string | null) {
 
 function errorMessage(err: unknown) {
   const msg = err instanceof Error ? err.message : String(err);
+  if (isAbortError(err) || /abort/i.test(msg)) return 'Connection timed out. Please try again.';
   if (/network request failed|unable to resolve|failed to fetch/i.test(msg)) return 'Cannot reach ZepMed. Check internet and try again.';
   if (/timeout|timed out/i.test(msg)) return 'Connection timed out. Try again.';
   if (/server error \(502\)|bad gateway|http 502/i.test(msg)) return 'ZepMed server gateway error (502). The backend is temporarily unavailable; retry in a moment.';
   if (/server error \(503\)|server error \(504\)/i.test(msg)) return 'ZepMed server is temporarily unavailable. Retry in a moment.';
   return msg || 'Something went wrong.';
+}
+
+function isAbortError(err: unknown) {
+  return err instanceof Error && (err.name === 'AbortError' || /aborted|abort/i.test(err.message));
 }
 
 function delay(ms: number) {
@@ -715,7 +734,7 @@ function CenteredLoader({ compact = false }: { compact?: boolean }) {
 }
 
 function AuthScreen({ onDone }: { onDone: () => void }) {
-  const [tab, setTab] = useState<AuthTab>('password');
+  const [tab, setTab] = useState<AuthTab>('otp');
   const [mobile, setMobile] = useState('');
   const [password, setPassword] = useState('');
   const [otp, setOtp] = useState('');
@@ -742,30 +761,50 @@ function AuthScreen({ onDone }: { onDone: () => void }) {
   }
 
   return (
-    <ScrollView style={s.screen} contentContainerStyle={s.authWrap} keyboardShouldPersistTaps="handled">
-      <View style={s.authHero}>
-        <View style={s.zTile}><Text style={s.zText}>Z+</Text></View>
-        <Text style={s.authTitle}>Welcome back</Text>
-        <Text style={s.authSub}>Manage your pharmacy operations securely</Text>
+    <ScrollView style={s.authScreen} contentContainerStyle={s.authWrap} keyboardShouldPersistTaps="handled">
+      <View style={s.loginBrand}>
+        <View style={s.loginLogo}><Text style={s.loginLogoText}>+</Text></View>
+        <Text style={s.loginBrandText}>Zep<Text style={{ color: C.redAccent }}>Med</Text></Text>
       </View>
-      <Segment<AuthTab>
-        value={tab}
-        options={[['password', 'Password'], ['otp', 'OTP'], ['register', 'Register']]}
-        onChange={(v) => { setTab(v); setError(''); setNotice('Secure seller access'); }}
-      />
+      <Text style={s.loginTitle}>Welcome to ZepMed</Text>
+      <Text style={s.loginSub}>Your premium healthcare & medicine companion</Text>
+
+      {tab === 'otp' ? (
+        <>
+          <Text style={s.loginLabel}>ENTER MOBILE NUMBER</Text>
+          <View style={s.phoneInputRow}>
+            <Text style={s.countryCode}>+91</Text>
+            <View style={s.phoneDivider} />
+            <TextInput
+              value={mobile}
+              onChangeText={(v) => setMobile(v.replace(/\D/g, '').slice(0, 10))}
+              keyboardType="phone-pad"
+              placeholder="98765 43210"
+              placeholderTextColor="#A6ADBB"
+              style={s.phoneInput}
+            />
+          </View>
+          <TouchableOpacity style={[s.otpButton, loading && { opacity: 0.6 }]} disabled={loading} onPress={() => run(() => authApi.sendLoginOtp(mobile), 'OTP sent. Check WhatsApp.')}>
+            <Text style={s.otpButtonText}>{loading ? 'Sending...' : 'Send OTP'}</Text>
+          </TouchableOpacity>
+          {notice.includes('OTP sent') || otp ? <Field label="OTP" value={otp} onChangeText={setOtp} keyboardType="number-pad" /> : null}
+          {notice.includes('OTP sent') || otp ? <Primary label={loading ? 'Verifying...' : 'Verify OTP'} disabled={loading} onPress={() => run(() => authApi.loginOtp(mobile, otp))} /> : null}
+          <View style={s.orRow}><View style={s.orLine} /><Text style={s.orText}>OR</Text><View style={s.orLine} /></View>
+          <TouchableOpacity style={s.whatsappButton} disabled={loading} onPress={() => run(() => authApi.sendLoginOtp(mobile), 'OTP sent on WhatsApp.')}>
+            <Text style={s.whatsappText}>▱  Login via WhatsApp</Text>
+          </TouchableOpacity>
+          <View style={s.authLinks}>
+            <TouchableOpacity onPress={() => { setTab('password'); setError(''); }}><Text style={s.authLinkText}>Password login</Text></TouchableOpacity>
+            <TouchableOpacity onPress={() => { setTab('register'); setError(''); }}><Text style={s.authLinkText}>Register seller</Text></TouchableOpacity>
+          </View>
+        </>
+      ) : null}
       {tab === 'password' ? (
         <>
           <Field label="Mobile" value={mobile} onChangeText={setMobile} keyboardType="phone-pad" />
           <Field label="Password" value={password} onChangeText={setPassword} secureTextEntry />
           <Primary label={loading ? 'Signing in...' : 'Sign In'} disabled={loading} onPress={() => run(() => authApi.loginPassword(mobile, password))} />
-        </>
-      ) : null}
-      {tab === 'otp' ? (
-        <>
-          <Field label="Mobile" value={mobile} onChangeText={setMobile} keyboardType="phone-pad" />
-          <Field label="OTP" value={otp} onChangeText={setOtp} keyboardType="number-pad" />
-          <Secondary label="Send OTP" disabled={loading} onPress={() => run(() => authApi.sendLoginOtp(mobile), 'OTP sent. Check WhatsApp.')} />
-          <Primary label={loading ? 'Verifying...' : 'Login with OTP'} disabled={loading} onPress={() => run(() => authApi.loginOtp(mobile, otp))} />
+          <Secondary label="Back to OTP login" disabled={loading} onPress={() => setTab('otp')} />
         </>
       ) : null}
       {tab === 'register' ? (
@@ -779,9 +818,11 @@ function AuthScreen({ onDone }: { onDone: () => void }) {
           <Field label="GST optional" value={gst} onChangeText={setGst} />
           <Secondary label="Send registration OTP" disabled={loading} onPress={() => run(() => authApi.sendRegisterOtp(mobile), 'Registration OTP sent.')} />
           <Primary label={loading ? 'Submitting...' : 'Register as seller'} disabled={loading} onPress={() => run(() => authApi.registerSeller({ mobile, otp, name, password, storeName, drugLicense, gst }))} />
+          <Secondary label="Back to OTP login" disabled={loading} onPress={() => setTab('otp')} />
         </>
       ) : null}
-      {error ? <Notice tone="error" title={error} /> : <Notice tone="success" title={notice} body="Session and preferences are stored securely." />}
+      {error ? <Notice tone="error" title={error} /> : notice.includes('OTP sent') ? <Notice tone="success" title={notice} /> : null}
+      <Text style={s.termsText}>By continuing, you agree to our <Text style={s.termsLink}>Terms of Service</Text> and <Text style={s.termsLink}>Privacy Policy</Text></Text>
     </ScrollView>
   );
 }
@@ -825,7 +866,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
         const d = await sellerApi.dashboard();
         setDash(d.data ?? null);
       } catch (err) {
-        nextError = errorMessage(err);
+        if (!silent || !isAbortError(err)) nextError = errorMessage(err);
       }
 
       let next: Order[] = [];
@@ -833,7 +874,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
         const o = await sellerApi.orders();
         next = (o.data?.items ?? []).sort((a, b) => (b.created_at ?? '').localeCompare(a.created_at ?? '') || b.id - a.id);
       } catch (err) {
-        nextError = nextError || errorMessage(err);
+        if (!silent || !isAbortError(err)) nextError = nextError || errorMessage(err);
       }
 
       const firstFresh = next.find((order) => !knownOrders.current.has(order.id) && pendingStatus(order.status));
@@ -854,12 +895,12 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
           const inv = await sellerApi.inventory();
           setInventory(inv.data?.items ?? []);
         } catch (err) {
-          if (!inventory.length) nextError = nextError || errorMessage(err);
+          if (!isAbortError(err) && !inventory.length) nextError = nextError || errorMessage(err);
         }
       }
       if (nextError) setError(nextError);
     } catch (err) {
-      setError(errorMessage(err));
+      if (!silent || !isAbortError(err)) setError(errorMessage(err));
     } finally {
       setRefreshing(false);
       refreshInFlight.current = false;
@@ -937,6 +978,17 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
     }
   }
 
+  async function toggleStoreOpen(nextOpen: boolean) {
+    try {
+      const current = await sellerApi.settings().catch(() => ({ data: { settings: dash ? {} : undefined } as SellerSettings }));
+      await sellerApi.saveSettings({ ...(current.data?.settings ?? {}), is_open: nextOpen ? 1 : 0 });
+      setDash((currentDash) => currentDash ? { ...currentDash, is_open: nextOpen } : currentDash);
+      await refresh(true);
+    } catch (err) {
+      Alert.alert('Store status', errorMessage(err));
+    }
+  }
+
   function openDashboardTarget(target: DashboardTarget) {
     if (target === 'revenue') {
       setShowReport(true);
@@ -956,16 +1008,15 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
         title={tab === 'home' ? 'ZepMed Seller' : tab[0].toUpperCase() + tab.slice(1)}
         subtitle={[dash?.pharmacy?.name, dash?.pharmacy?.city].filter(Boolean).join(' • ') || 'Pharmacy'}
         onRefresh={() => refresh()}
-        onLogout={onLogout}
       />
       <ScrollView refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => refresh()} tintColor={C.orange} />} contentContainerStyle={s.body}>
         {fresh && tab === 'orders' ? <FreshBanner order={fresh} onClose={() => setFresh(null)} onOpen={() => openOrder(fresh.id)} /> : null}
         {error ? <Notice tone="error" title={error} /> : null}
-        {tab === 'home' ? <HomeScreen dash={dash} orders={orders} onOpenOrder={openOrder} onAction={action} onDashboardTarget={openDashboardTarget} /> : null}
+        {tab === 'home' ? <HomeScreen dash={dash} orders={orders} onOpenOrder={openOrder} onAction={action} onDashboardTarget={openDashboardTarget} onStoreToggle={toggleStoreOpen} /> : null}
         {tab === 'orders' ? <OrdersScreen orders={orders} filter={orderFilter} onFilter={setOrderFilter} onOpenOrder={openOrder} onAction={action} /> : null}
         {tab === 'catalog' ? <CatalogScreen items={inventory} onEdit={setEditItem} onWholesale={() => goTab('wholesale')} /> : null}
         {tab === 'wholesale' ? <WholesaleScreen dash={dash} canWholesale={Boolean(canWholesale)} onRefresh={() => refresh(true)} /> : null}
-        {tab === 'more' ? <MoreScreen dash={dash} onReport={() => setShowReport(true)} onOpenModule={setMoreModule} onRefresh={() => refresh()} /> : null}
+        {tab === 'more' ? <MoreScreen dash={dash} onReport={() => setShowReport(true)} onOpenModule={setMoreModule} onRefresh={() => refresh()} onLogout={onLogout} /> : null}
       </ScrollView>
       <BottomTabs current={tab} setTab={goTab} pending={orders.filter((o) => pendingStatus(o.status)).length} showWholesale={Boolean(canWholesale)} />
       <StockEditModal item={editItem} onClose={() => setEditItem(null)} onSaved={() => { setEditItem(null); refresh(true); }} />
@@ -974,7 +1025,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
   );
 }
 
-function Header({ title, subtitle, onRefresh, onLogout }: { title: string; subtitle: string; onRefresh: () => void; onLogout: () => void }) {
+function Header({ title, subtitle, onRefresh, onLogout }: { title: string; subtitle: string; onRefresh: () => void; onLogout?: () => void }) {
   return (
     <View style={s.header}>
       <View style={{ flex: 1 }}>
@@ -982,7 +1033,7 @@ function Header({ title, subtitle, onRefresh, onLogout }: { title: string; subti
         <Text style={s.headerSub} numberOfLines={1}>{subtitle}</Text>
       </View>
       <IconButton label="↻" onPress={onRefresh} />
-      <IconButton label="↗" onPress={onLogout} />
+      {onLogout ? <IconButton label="↗" onPress={onLogout} /> : null}
     </View>
   );
 }
@@ -993,14 +1044,17 @@ function HomeScreen({
   onOpenOrder,
   onAction,
   onDashboardTarget,
+  onStoreToggle,
 }: {
   dash: DashboardData | null;
   orders: Order[];
   onOpenOrder: (id: number) => void;
   onAction: (id: number, code: string) => void;
   onDashboardTarget: (target: DashboardTarget) => void;
+  onStoreToggle: (nextOpen: boolean) => void;
 }) {
   if (!dash) return <CenteredLoader />;
+  const open = dash.is_open !== false && dash.is_open !== 0;
   return (
     <>
       <View style={s.dashboardCard}>
@@ -1009,14 +1063,15 @@ function HomeScreen({
             <Text style={s.bigTitle}>{dash.pharmacy?.name || 'Your pharmacy'}</Text>
             <Text style={s.muted}>{dash.pharmacy?.city || 'Open for orders'} • Open for orders</Text>
           </View>
-          <Pill text="Live" tone="green" />
+          <Pill text={open ? 'Open' : 'Closed'} tone={open ? 'green' : 'red'} />
         </View>
-        <View style={s.kpiGrid}>
-          <Kpi label="Orders" value={String(dash.orders_total ?? 0)} tone="blue" onPress={() => onDashboardTarget('orders')} />
-          <Kpi label="Pending" value={String(dash.pending_dispatch ?? 0)} tone="orange" onPress={() => onDashboardTarget('pending')} />
-          <Kpi label="Revenue" value={shortMoney(dash.revenue_total)} tone="green" onPress={() => onDashboardTarget('revenue')} />
-          <Kpi label="Delivered" value={String(dash.delivered_count ?? 0)} tone="purple" onPress={() => onDashboardTarget('delivered')} />
-        </View>
+        <TouchableOpacity style={[s.storeToggle, open ? s.storeToggleOpen : s.storeToggleClosed]} onPress={() => onStoreToggle(!open)}>
+          <View>
+            <Text style={[s.storeToggleTitle, { color: open ? C.green : C.red }]}>{open ? 'Store is open' : 'Store is closed'}</Text>
+            <Text style={[s.storeToggleBody, { color: open ? C.green : C.red }]}>{open ? 'Tap to stop receiving new customer orders' : 'Tap to start receiving new customer orders'}</Text>
+          </View>
+          <Text style={[s.storeToggleAction, { color: open ? C.green : C.red }]}>{open ? 'Close' : 'Open'}</Text>
+        </TouchableOpacity>
       </View>
       <View style={[s.infoCard, { backgroundColor: C.blueSoft }]}>
         <Text style={[s.infoTitle, { color: C.blue }]}>Global catalog synced</Text>
@@ -1106,7 +1161,7 @@ function CatalogScreen({ items, onEdit, onWholesale }: { items: InventoryItem[];
   );
 }
 
-function MoreScreen({ dash, onReport, onOpenModule, onRefresh }: { dash: DashboardData | null; onReport: () => void; onOpenModule: (module: MoreModule) => void; onRefresh: () => void }) {
+function MoreScreen({ dash, onReport, onOpenModule, onRefresh, onLogout }: { dash: DashboardData | null; onReport: () => void; onOpenModule: (module: MoreModule) => void; onRefresh: () => void; onLogout: () => void }) {
   return (
     <>
       <SectionTitle title="Pharmacy profile" />
@@ -1126,6 +1181,8 @@ function MoreScreen({ dash, onReport, onOpenModule, onRefresh }: { dash: Dashboa
       <MenuItem title="Daily Sales Report" body="Day-wise item sales and report summary" onPress={onReport} />
       <MenuItem title="Sync data" body="Refresh dashboard, orders and catalog" onPress={onRefresh} />
       <SubscriptionSection dash={dash} />
+      <MenuItem title="Logout" body="Sign out from this seller device" onPress={onLogout} />
+      <MenuItem title="App Support" body="Use this when backend or order sync needs checking" onPress={() => Alert.alert('Support', 'Contact ZepMed support with your pharmacy name and mobile number.')} />
       <Text style={s.footer}>ZepMed Seller partner app</Text>
     </>
   );
@@ -1526,7 +1583,9 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
   const [notes, setNotes] = useState(order.seller_notes || '');
   const [acting, setActing] = useState(false);
   const [fulfill, setFulfill] = useState<Record<number, string>>({});
-  const [rxRows, setRxRows] = useState<Array<{ name: string; qty: string; price: string }>>([{ name: '', qty: '1', price: '' }]);
+  const [rxRows, setRxRows] = useState<RxMedicineRow[]>([{ name: '', qty: '1', price: '' }]);
+  const [rxSuggest, setRxSuggest] = useState<Record<number, CatalogSuggestion[]>>({});
+  const [rxImageOpen, setRxImageOpen] = useState(false);
 
   useEffect(() => {
     const next: Record<number, string> = {};
@@ -1537,6 +1596,33 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
   async function reload() {
     const res = await sellerApi.orderDetail(detail.id);
     if (res.data) setDetail(res.data);
+  }
+
+  function updateRxRow(index: number, next: Partial<RxMedicineRow>) {
+    setRxRows((rows) => rows.map((row, i) => i === index ? { ...row, ...next } : row));
+  }
+
+  async function searchRxCatalog(index: number, text: string) {
+    updateRxRow(index, { name: text, product_id: undefined });
+    if (text.trim().length < 2) {
+      setRxSuggest((all) => ({ ...all, [index]: [] }));
+      return;
+    }
+    try {
+      const res = await sellerApi.catalogSearch(text);
+      setRxSuggest((all) => ({ ...all, [index]: res.data?.items ?? [] }));
+    } catch {
+      setRxSuggest((all) => ({ ...all, [index]: [] }));
+    }
+  }
+
+  function chooseRxProduct(index: number, product: CatalogSuggestion) {
+    updateRxRow(index, {
+      product_id: product.product_id,
+      name: product.name,
+      price: product.price != null ? String(product.price) : '',
+    });
+    setRxSuggest((all) => ({ ...all, [index]: [] }));
   }
 
   async function run(code: string) {
@@ -1573,7 +1659,7 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
   }
 
   async function submitRx() {
-    const items = rxRows.filter((r) => r.name.trim()).map((r) => ({ medicine_name: r.name.trim(), quantity: Number(r.qty || 1), price: Number(r.price || 0), disposition: 'fulfill' }));
+    const items = rxRows.filter((r) => r.name.trim()).map((r) => ({ product_id: r.product_id, medicine_name: r.name.trim(), quantity: Number(r.qty || 1), price: Number(r.price || 0), disposition: 'fulfill' }));
     if (!items.length) return Alert.alert('Prescription', 'Add medicines you will supply.');
     setActing(true);
     try {
@@ -1601,7 +1687,12 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
           <Text style={s.muted}>{[detail.address_line, detail.city, detail.pincode].filter(Boolean).join(', ')}</Text>
           <View style={s.rowBetween}><Text style={s.amount}>Total {money(detail.total_amount)}</Text>{detail.payment_method ? <Pill text={detail.payment_method.toUpperCase()} tone="blue" /> : null}</View>
         </View>
-        {rx && mediaUrl(detail.prescription_url) ? <Image source={{ uri: mediaUrl(detail.prescription_url) }} style={s.rxImage} resizeMode="contain" /> : null}
+        {rx && mediaUrl(detail.prescription_url) ? (
+          <TouchableOpacity activeOpacity={0.9} onPress={() => setRxImageOpen(true)}>
+            <Image source={{ uri: mediaUrl(detail.prescription_url) }} style={s.rxImage} resizeMode="contain" />
+            <Text style={s.tapHint}>Tap prescription to view fullscreen</Text>
+          </TouchableOpacity>
+        ) : null}
         {detail.tracking?.length ? (
           <>
             <SectionTitle title="Tracking timeline" />
@@ -1613,10 +1704,19 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
           <>
             {rxRows.map((row, idx) => (
               <View key={idx} style={s.card}>
-                <Field label="Medicine name" value={row.name} onChangeText={(v) => setRxRows((rows) => rows.map((r, i) => i === idx ? { ...r, name: v } : r))} />
+                <Field label="Medicine name" value={row.name} onChangeText={(v) => searchRxCatalog(idx, v)} />
+                {(rxSuggest[idx] ?? []).slice(0, 5).map((product) => (
+                  <TouchableOpacity key={product.product_id} style={s.suggestionRow} onPress={() => chooseRxProduct(idx, product)}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={s.itemTitle}>{product.name}</Text>
+                      <Text style={s.muted}>{product.seller_stock ?? 0} available</Text>
+                    </View>
+                    <Text style={s.itemPrice}>{money(product.price)}</Text>
+                  </TouchableOpacity>
+                ))}
                 <View style={s.inputRow}>
-                  <Field label="Qty" value={row.qty} onChangeText={(v) => setRxRows((rows) => rows.map((r, i) => i === idx ? { ...r, qty: v.replace(/\D/g, '') } : r))} keyboardType="number-pad" compact />
-                  <Field label="Price" value={row.price} onChangeText={(v) => setRxRows((rows) => rows.map((r, i) => i === idx ? { ...r, price: v.replace(/[^0-9.]/g, '') } : r))} keyboardType="decimal-pad" compact />
+                  <Field label="Qty" value={row.qty} onChangeText={(v) => updateRxRow(idx, { qty: v.replace(/\D/g, '') })} keyboardType="number-pad" compact />
+                  <Field label="Price" value={row.price} onChangeText={(v) => updateRxRow(idx, { price: v.replace(/[^0-9.]/g, '') })} keyboardType="decimal-pad" compact />
                 </View>
               </View>
             ))}
@@ -1632,7 +1732,10 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
           ))
         )}
         <Field label="Notes to customer" value={notes} onChangeText={setNotes} multiline />
-        {pending && rx ? <Primary label={acting ? 'Saving...' : 'Confirm order'} disabled={acting} onPress={submitRx} /> : null}
+        {pending && rx && detail.status === 'prescription_review' && !detail.seller_confirmed_at ? (
+          <Primary label={acting ? 'Accepting...' : 'Accept Prescription'} disabled={acting} onPress={() => run('rx_accept')} />
+        ) : null}
+        {pending && rx ? <Primary label={acting ? 'Saving...' : 'Send medicines to cart'} disabled={acting} onPress={submitRx} /> : null}
         {pending && !rx ? (
           <>
             <Primary label="Confirm & Save" disabled={acting} onPress={() => process('confirmed')} />
@@ -1643,6 +1746,14 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
         ) : null}
         {!pending && quickActions(detail.status).map((a) => <Primary key={a.code} label={a.label} disabled={acting} onPress={() => run(a.code)} />)}
       </ScrollView>
+      <Modal visible={rxImageOpen} animationType="fade" onRequestClose={() => setRxImageOpen(false)}>
+        <View style={s.imageViewer}>
+          <TouchableOpacity style={s.imageClose} onPress={() => setRxImageOpen(false)}>
+            <Text style={s.imageCloseText}>Close</Text>
+          </TouchableOpacity>
+          {mediaUrl(detail.prescription_url) ? <Image source={{ uri: mediaUrl(detail.prescription_url) }} style={s.fullRxImage} resizeMode="contain" /> : null}
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -1806,7 +1917,7 @@ function OrderCard({ order, onOpen, onAction }: { order: Order; onOpen: () => vo
       </View>
       <View style={s.actionRow}>
         {order.payment_method ? <Pill text={order.payment_method.toUpperCase()} /> : null}
-        {quickActions(order.status).map((a) => <TouchableOpacity key={a.code} style={s.actionPill} onPress={() => onAction(a.code)}><Text style={s.actionText}>{a.label}</Text></TouchableOpacity>)}
+        {orderCardActions(order).map((a) => <TouchableOpacity key={a.code} style={s.actionPill} onPress={() => onAction(a.code)}><Text style={s.actionText}>{a.label}</Text></TouchableOpacity>)}
       </View>
     </TouchableOpacity>
   );
@@ -2025,10 +2136,33 @@ const s = StyleSheet.create({
   splashSub: { marginTop: 8, color: C.muted, fontSize: 16 },
   dots: { flexDirection: 'row', gap: 12, marginTop: 56 },
   dot: { width: 10, height: 10, borderRadius: 5, backgroundColor: C.orange },
-  authWrap: { padding: 28, gap: 20 },
+  authScreen: { flex: 1, backgroundColor: '#FFF' },
+  authWrap: { paddingHorizontal: 34, paddingTop: 104, paddingBottom: 48, gap: 18, minHeight: '100%' },
   authHero: { backgroundColor: '#FFF', borderColor: C.line, borderWidth: 1, borderRadius: 22, padding: 20, minHeight: 176, justifyContent: 'center' },
   authTitle: { marginTop: 16, color: C.ink, fontSize: 27, fontWeight: '900' },
   authSub: { color: C.muted, marginTop: 4, fontSize: 14 },
+  loginBrand: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 12, marginBottom: 28 },
+  loginLogo: { width: 50, height: 50, borderRadius: 12, backgroundColor: C.redAccent, alignItems: 'center', justifyContent: 'center' },
+  loginLogoText: { color: '#FFF', fontSize: 34, fontWeight: '800', marginTop: -2 },
+  loginBrandText: { color: '#101828', fontSize: 32, fontWeight: '900' },
+  loginTitle: { color: '#111827', textAlign: 'center', fontSize: 28, fontWeight: '900', marginTop: 4 },
+  loginSub: { color: '#667085', textAlign: 'center', fontSize: 16, marginBottom: 36 },
+  loginLabel: { color: '#667085', fontSize: 14, fontWeight: '900' },
+  phoneInputRow: { height: 58, borderRadius: 10, borderWidth: 1, borderColor: '#D7DDE6', backgroundColor: '#F9FAFB', flexDirection: 'row', alignItems: 'center', paddingHorizontal: 18 },
+  countryCode: { color: '#111827', fontSize: 20, fontWeight: '900' },
+  phoneDivider: { width: 1, height: 24, backgroundColor: '#AEB6C3', marginHorizontal: 14 },
+  phoneInput: { flex: 1, color: '#111827', fontSize: 18, minHeight: 58 },
+  otpButton: { height: 60, borderRadius: 10, backgroundColor: C.redAccent, alignItems: 'center', justifyContent: 'center', marginTop: 10 },
+  otpButtonText: { color: '#FFF', fontSize: 18, fontWeight: '900' },
+  orRow: { flexDirection: 'row', alignItems: 'center', gap: 14, marginVertical: 16 },
+  orLine: { flex: 1, height: 1, backgroundColor: '#EAECF0' },
+  orText: { color: '#98A2B3', fontWeight: '900', fontSize: 13 },
+  whatsappButton: { height: 60, borderRadius: 10, borderWidth: 1, borderColor: '#22C55E', backgroundColor: '#ECFDF3', alignItems: 'center', justifyContent: 'center' },
+  whatsappText: { color: '#22C55E', fontSize: 17, fontWeight: '900' },
+  authLinks: { flexDirection: 'row', justifyContent: 'center', gap: 22, marginTop: 2 },
+  authLinkText: { color: C.redAccent, fontWeight: '800', fontSize: 13 },
+  termsText: { color: '#667085', fontSize: 12, lineHeight: 18, textAlign: 'center', marginTop: 'auto' },
+  termsLink: { color: C.redAccent, textDecorationLine: 'underline' },
   header: { minHeight: 92, paddingHorizontal: 18, paddingBottom: 16, flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: C.bg },
   headerTitle: { color: C.ink, fontWeight: '900', fontSize: 22 },
   headerSub: { color: C.muted, marginTop: 3, fontSize: 12 },
@@ -2045,6 +2179,12 @@ const s = StyleSheet.create({
   kpiLabel: { color: C.muted, fontSize: 12, fontWeight: '800' },
   kpiValue: { color: C.ink, fontSize: 26, fontWeight: '900', marginTop: 4 },
   kpiArrow: { position: 'absolute', right: 12, bottom: 8, fontSize: 28, fontWeight: '900' },
+  storeToggle: { minHeight: 72, borderRadius: 16, padding: 14, borderWidth: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12 },
+  storeToggleOpen: { backgroundColor: C.greenSoft, borderColor: '#C6DCCB' },
+  storeToggleClosed: { backgroundColor: C.redSoft, borderColor: '#E2C0C0' },
+  storeToggleTitle: { fontSize: 16, fontWeight: '900' },
+  storeToggleBody: { fontSize: 12, marginTop: 4 },
+  storeToggleAction: { fontSize: 14, fontWeight: '900' },
   infoCard: { borderRadius: 16, padding: 16 },
   infoTitle: { fontWeight: '900', fontSize: 15 },
   infoText: { marginTop: 6, fontSize: 13 },
@@ -2109,6 +2249,12 @@ const s = StyleSheet.create({
   qtyInput: { width: 78, height: 48, borderRadius: 14, borderWidth: 1, borderColor: C.line, backgroundColor: '#FFF', textAlign: 'center', color: C.ink, fontWeight: '900' },
   backText: { color: C.orange, fontSize: 16, fontWeight: '900' },
   rxImage: { height: 250, backgroundColor: '#FFF', borderRadius: 16, borderWidth: 1, borderColor: C.line },
+  tapHint: { color: C.muted, textAlign: 'center', fontSize: 12, marginTop: 8 },
+  suggestionRow: { borderRadius: 14, borderWidth: 1, borderColor: C.line, backgroundColor: C.beige, padding: 12, flexDirection: 'row', alignItems: 'center', gap: 10 },
+  imageViewer: { flex: 1, backgroundColor: '#000', alignItems: 'center', justifyContent: 'center' },
+  imageClose: { position: 'absolute', top: 44, right: 18, zIndex: 2, minHeight: 42, borderRadius: 22, backgroundColor: 'rgba(255,255,255,0.92)', paddingHorizontal: 18, alignItems: 'center', justifyContent: 'center' },
+  imageCloseText: { color: C.ink, fontWeight: '900' },
+  fullRxImage: { width: '100%', height: '100%' },
   virtualBanner: { backgroundColor: '#FFF7ED', borderRadius: 14, padding: 12 },
   virtualTitle: { color: C.orangeDark, fontWeight: '900', fontSize: 13 },
   virtualText: { color: C.yellow, fontSize: 12, marginTop: 4 },
