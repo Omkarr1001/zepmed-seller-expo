@@ -211,6 +211,24 @@ type TabKey = 'home' | 'orders' | 'catalog' | 'wholesale' | 'more';
 type AuthTab = 'password' | 'otp' | 'register';
 type OrderFilter = 'all' | 'pending' | 'rx' | 'preparing' | 'ready' | 'delivered';
 type DashboardTarget = 'orders' | 'pending' | 'revenue' | 'delivered';
+type MoreModule = 'pharmacy' | 'settings' | 'notifications' | 'rx' | 'stock' | 'virtual' | 'payouts' | null;
+type SellerSettings = {
+  settings?: {
+    store?: { auto_mode?: boolean | number; open_time?: string; close_time?: string; days?: number[] };
+    notifications?: { order_sound?: boolean; order_vibrate?: boolean; desktop_alert?: boolean };
+    advanced?: { order_poll_sec?: number; low_stock_alert?: boolean };
+    modules?: Record<string, boolean>;
+  };
+  is_open?: boolean | number;
+  auto_active_now?: boolean | number;
+  pharmacy?: PharmacyInfo | null;
+};
+type SellerNotification = { id: number; title?: string | null; message?: string | null; body?: string | null; is_read?: number | boolean | null; created_at?: string | null; category?: string | null };
+type RxRequest = { id: number; customer_name?: string | null; status?: string | null; prescription_url?: string | null; created_at?: string | null; notes?: string | null };
+type StockSuggestion = { product_id?: number; id?: number; name?: string | null; product_name?: string | null; stock?: number | null; suggested_qty?: number | null; reason?: string | null };
+type StockManagementData = { items?: InventoryItem[] | null; summary?: Record<string, number> | null };
+type VirtualShopData = { pharmacy?: PharmacyInfo | null; settings?: SellerSettings['settings']; managed_inventory?: boolean | number; discounts?: unknown[]; banners?: unknown[]; listing_status?: string | null };
+type PayoutOrder = { id: number; order_number?: string | null; status?: string | null; seller_payout_amount?: number | null; total_amount?: number | null; cod_collected?: number | null; created_at?: string | null };
 
 function cleanMobile(raw: string) {
   let mobile = raw.replace(/\D/g, '');
@@ -563,13 +581,49 @@ const sellerApi = {
   updateStock: (body: unknown) => request<Record<string, unknown>>('seller/inventory/update', { body }),
   catalogSearch: (search: string) => request<{ items?: Array<{ product_id: number; name: string; price?: number | null; seller_stock?: number | null }> | null }>('seller/catalog/search', { query: { search, limit: 15 } }),
   dailySalesReport: (from: string, to: string) => request<DailySalesReport>('seller/reports/daily-sales', { query: { from, to } }),
+  orderSalesReport: (from: string, to: string) => request<DailySalesReport>('seller/reports/order-sales', { query: { from, to } }),
+  rxOrdersReport: (from: string, to: string) => request<Record<string, unknown>>('seller/reports/rx-orders', { query: { from, to } }),
+  walletTransactions: (from: string, to: string) => request<{ items?: PayoutOrder[] | null; summary?: Record<string, number> | null }>('seller/reports/wallet-transactions', { query: { from, to, limit: 100 } }),
+  payoutOrders: () => request<{ items?: PayoutOrder[] | null; summary?: Record<string, number> | null }>('seller/payouts/orders', { query: { limit: 100, status: 'all' } }),
+  pharmacyInfo: () => request<PharmacyInfo>('seller/pharmacy-info'),
+  savePharmacyInfo: (body: unknown) => request<PharmacyInfo>('seller/pharmacy-info', { body }),
+  settings: () => request<SellerSettings>('seller/settings'),
+  saveSettings: (body: unknown) => request<SellerSettings>('seller/settings', { body }),
+  notifications: (unread = false) => request<{ items?: SellerNotification[] | null; pagination?: unknown }>('seller/notifications', { query: { page: 1, limit: 50, unread: unread ? 1 : undefined } }),
+  notificationUnreadCount: () => request<{ unread_count?: number | null }>('seller/notifications/unread-count'),
+  markNotificationRead: (id: number) => request<Record<string, unknown>>(`seller/notifications/${id}/read`, { body: {} }),
+  markAllNotificationsRead: () => request<Record<string, unknown>>('seller/notifications/read-all', { body: {} }),
+  rxRequests: () => request<{ items?: RxRequest[] | null }>('seller/rx-requests', { query: { status: 'open' } }),
+  rxRequestDetail: (requestId: number) => request<RxRequest>('seller/rx-requests/detail', { query: { request_id: requestId } }),
+  rxRequestFillToCart: (body: unknown) => request<Record<string, unknown>>('seller/rx-requests/fill-to-cart', { body }),
+  rxRequestReject: (body: unknown) => request<Record<string, unknown>>('seller/rx-requests/reject', { body }),
+  rxRequestSendMessage: (body: unknown) => request<Record<string, unknown>>('seller/rx-requests/send-message', { body }),
+  prescriptionFillToCart: (body: unknown) => request<Record<string, unknown>>('seller/orders/prescription-fill-to-cart', { body }),
   wholesellers: () => request<{ items?: WholesellerPharmacy[] | null }>('seller/pharmacies/wholesellers'),
+  wholesaleLowStock: () => request<{ items?: InventoryItem[] | null }>('seller/wholesale/low-stock'),
   wholesaleCatalog: (id: number) => request<{ items?: InventoryItem[] | null }>('seller/wholesale/catalog', { query: { wholeseller_pharmacy_id: id } }),
   wholesaleOrders: (mode: 'buyer' | 'wholeseller') => request<{ items?: WholesaleOrder[] | null }>('seller/wholesale/orders', { query: { mode } }),
+  wholesaleOrderDetail: (orderId: number) => request<WholesaleOrder>('seller/wholesale/orders/detail', { query: { order_id: orderId } }),
+  wholesaleOrderInvoice: (orderId: number) => request<WholesaleOrder>('seller/wholesale/orders/invoice', { query: { order_id: orderId } }),
+  wholesaleTransactions: () => request<{ items?: unknown[] | null }>('seller/wholesale/transactions'),
   createWholesaleOrder: (body: unknown) => request<WholesaleOrder>('seller/wholesale/orders/create', { body }),
-  wholesaleAction: (orderId: number, action: string) => request<WholesaleOrder>('seller/wholesale/orders/action', { body: { order_id: orderId, action } }),
+  wholesaleAction: (orderId: number, action: string, extra?: Record<string, unknown>) => request<WholesaleOrder>('seller/wholesale/orders/action', { body: { order_id: orderId, action, ...(extra ?? {}) } }),
+  attachInventory: (body: unknown) => request<Record<string, unknown>>('seller/inventory/attach', { body }),
+  productCategories: () => request<{ items?: Array<{ id: number; name: string }> | null }>('seller/products/categories'),
+  submitProduct: (body: unknown) => request<Record<string, unknown>>('seller/products/submit', { body }),
+  stockManagement: (view = 'all', search = '') => request<StockManagementData>('seller/stock-management', { query: { page: 1, limit: 50, view, search } }),
+  stockSuggestions: () => request<{ items?: StockSuggestion[] | null; summary?: Record<string, number> | null }>('seller/stock-management/suggestions'),
+  addStock: (body: unknown) => request<Record<string, unknown>>('seller/stock-management/add', { body }),
+  adjustStock: (body: unknown) => request<Record<string, unknown>>('seller/stock-management/adjust', { body }),
+  stockHistory: () => request<{ items?: unknown[] | null }>('seller/stock-management/history', { query: { page: 1, limit: 50 } }),
+  virtualShop: () => request<VirtualShopData>('seller/virtual-shop'),
+  saveVirtualShop: (body: unknown) => request<VirtualShopData>('seller/virtual-shop', { body }),
+  discountRules: () => request<{ items?: unknown[] | null }>('seller/discount-rules'),
+  saveDiscountRule: (body: unknown) => request<Record<string, unknown>>('seller/discount-rules/save', { body }),
+  referral: () => request<Record<string, unknown>>('seller/referral'),
   subscription: () => request<SubscriptionInfo>('seller/subscription'),
   subscriptionPlans: () => request<{ items?: SellerPlan[] | null }>('seller/subscription/plans'),
+  subscriptionPreview: (planId: number) => request<Record<string, number | string | null>>('seller/subscription/preview', { query: { plan_id: planId, use_wallet: 1 } }),
   subscribePlan: (planId: number) => request<SubscriptionInfo>('seller/subscription/subscribe', { body: { plan_id: planId, payment_method: 'demo', demo_card: '4242 4242 4242 4242', simulate: 'success' } }),
 };
 
@@ -744,6 +798,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
   const [selectedOrder, setSelectedOrder] = useState<OrderDetail | null>(null);
   const [editItem, setEditItem] = useState<InventoryItem | null>(null);
   const [showReport, setShowReport] = useState(false);
+  const [moreModule, setMoreModule] = useState<MoreModule>(null);
   const [fresh, setFresh] = useState<Order | null>(null);
   const knownOrders = useRef<Set<number>>(new Set());
   const refreshInFlight = useRef(false);
@@ -843,6 +898,10 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
         setShowReport(false);
         return true;
       }
+      if (moreModule) {
+        setMoreModule(null);
+        return true;
+      }
       const previous = tabHistory.current.pop();
       if (previous && previous !== tab) {
         setTab(previous);
@@ -855,7 +914,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
       return false;
     });
     return () => sub.remove();
-  }, [refresh, selectedOrder, showReport, tab]);
+  }, [moreModule, refresh, selectedOrder, showReport, tab]);
 
   async function openOrder(id: number) {
     const seed = orders.find((order) => order.id === id);
@@ -889,6 +948,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
 
   if (selectedOrder) return <OrderDetailScreen order={selectedOrder} dash={dash} onBack={() => { setSelectedOrder(null); refresh(true); }} />;
   if (showReport) return <DailySalesScreen onBack={() => setShowReport(false)} />;
+  if (moreModule) return <MoreModuleScreen module={moreModule} dash={dash} onBack={() => { setMoreModule(null); refresh(true); }} />;
 
   return (
     <View style={[s.screen, { paddingTop: insets.top }]}>
@@ -905,7 +965,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
         {tab === 'orders' ? <OrdersScreen orders={orders} filter={orderFilter} onFilter={setOrderFilter} onOpenOrder={openOrder} onAction={action} /> : null}
         {tab === 'catalog' ? <CatalogScreen items={inventory} onEdit={setEditItem} onWholesale={() => goTab('wholesale')} /> : null}
         {tab === 'wholesale' ? <WholesaleScreen dash={dash} canWholesale={Boolean(canWholesale)} onRefresh={() => refresh(true)} /> : null}
-        {tab === 'more' ? <MoreScreen dash={dash} onReport={() => setShowReport(true)} onRefresh={() => refresh()} /> : null}
+        {tab === 'more' ? <MoreScreen dash={dash} onReport={() => setShowReport(true)} onOpenModule={setMoreModule} onRefresh={() => refresh()} /> : null}
       </ScrollView>
       <BottomTabs current={tab} setTab={goTab} pending={orders.filter((o) => pendingStatus(o.status)).length} showWholesale={Boolean(canWholesale)} />
       <StockEditModal item={editItem} onClose={() => setEditItem(null)} onSaved={() => { setEditItem(null); refresh(true); }} />
@@ -1046,7 +1106,7 @@ function CatalogScreen({ items, onEdit, onWholesale }: { items: InventoryItem[];
   );
 }
 
-function MoreScreen({ dash, onReport, onRefresh }: { dash: DashboardData | null; onReport: () => void; onRefresh: () => void }) {
+function MoreScreen({ dash, onReport, onOpenModule, onRefresh }: { dash: DashboardData | null; onReport: () => void; onOpenModule: (module: MoreModule) => void; onRefresh: () => void }) {
   return (
     <>
       <SectionTitle title="Pharmacy profile" />
@@ -1056,10 +1116,16 @@ function MoreScreen({ dash, onReport, onRefresh }: { dash: DashboardData | null;
         <Info label="Phone" value={dash?.pharmacy?.phone || 'Not set'} />
       </View>
       <SectionTitle title="Operations" />
-      <MenuItem title="Daily Sales Report" body="Day-wise items sold with export data" onPress={onReport} />
+      <MenuItem title="Pharmacy Info" body="Billing details, DL, GST, address and contact" onPress={() => onOpenModule('pharmacy')} />
+      <MenuItem title="Store Settings" body="Open/close, auto schedule, modules and alerts" onPress={() => onOpenModule('settings')} />
+      <MenuItem title="Notifications" body="Admin approvals, stock alerts and announcements" onPress={() => onOpenModule('notifications')} />
+      <MenuItem title="Prescription Rx" body="Accept Rx, fill cart, reject or message customer" onPress={() => onOpenModule('rx')} />
+      <MenuItem title="Stock Management" body="Suggestions, add stock, adjust stock and history" onPress={() => onOpenModule('stock')} />
+      <MenuItem title="Virtual Shop" body="My Store, listing, managed inventory and discounts" onPress={() => onOpenModule('virtual')} />
+      <MenuItem title="Payouts & Wallet" body="Seller payout orders and wallet transaction audit" onPress={() => onOpenModule('payouts')} />
+      <MenuItem title="Daily Sales Report" body="Day-wise item sales and report summary" onPress={onReport} />
       <MenuItem title="Sync data" body="Refresh dashboard, orders and catalog" onPress={onRefresh} />
       <SubscriptionSection dash={dash} />
-      <SettingsPanel />
       <Text style={s.footer}>ZepMed Seller partner app</Text>
     </>
   );
@@ -1191,6 +1257,267 @@ function WholesaleScreen({ dash, canWholesale, onRefresh }: { dash: DashboardDat
       {!loading && dash?.is_wholeseller && !incoming.length ? <Text style={s.muted}>No incoming wholesale orders yet.</Text> : null}
     </>
   );
+}
+
+function MoreModuleScreen({ module, dash, onBack }: { module: MoreModule; dash: DashboardData | null; onBack: () => void }) {
+  const insets = useSafeAreaInsets();
+  const title = module === 'pharmacy' ? 'Pharmacy Info'
+    : module === 'settings' ? 'Store Settings'
+      : module === 'notifications' ? 'Notifications'
+        : module === 'rx' ? 'Prescription Rx'
+          : module === 'stock' ? 'Stock Management'
+            : module === 'virtual' ? 'Virtual Shop'
+              : 'Payouts & Wallet';
+  return (
+    <View style={[s.screen, { paddingTop: insets.top }]}>
+      <View style={s.header}>
+        <TouchableOpacity onPress={onBack}><Text style={s.backText}>‹ Back</Text></TouchableOpacity>
+        <View style={{ flex: 1 }}><Text style={s.headerTitle}>{title}</Text><Text style={s.headerSub}>{dash?.pharmacy?.name || 'Seller module'}</Text></View>
+      </View>
+      <ScrollView contentContainerStyle={s.body}>
+        {module === 'pharmacy' ? <PharmacyInfoScreen /> : null}
+        {module === 'settings' ? <StoreSettingsScreen /> : null}
+        {module === 'notifications' ? <NotificationsScreen /> : null}
+        {module === 'rx' ? <RxRequestsScreen /> : null}
+        {module === 'stock' ? <StockManagementScreen /> : null}
+        {module === 'virtual' ? <VirtualShopScreen /> : null}
+        {module === 'payouts' ? <PayoutsScreen /> : null}
+      </ScrollView>
+    </View>
+  );
+}
+
+function PharmacyInfoScreen() {
+  const [form, setForm] = useState({ name: '', address: '', city: '', pincode: '', phone: '' });
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const load = useCallback(async () => {
+    setLoading(true); setError('');
+    try {
+      const res = await sellerApi.pharmacyInfo();
+      const p = res.data ?? {};
+      setForm({ name: p.name || '', address: p.address || '', city: p.city || '', pincode: p.pincode || '', phone: p.phone || '' });
+    } catch (err) { setError(errorMessage(err)); } finally { setLoading(false); }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+  async function save() {
+    setSaving(true);
+    try { await sellerApi.savePharmacyInfo(form); Alert.alert('Pharmacy', 'Pharmacy details saved'); }
+    catch (err) { Alert.alert('Pharmacy', errorMessage(err)); }
+    finally { setSaving(false); }
+  }
+  if (loading) return <CenteredLoader compact />;
+  return <FormCard error={error} onRetry={load}>
+    <Field label="Store name" value={form.name} onChangeText={(v) => setForm({ ...form, name: v })} />
+    <Field label="Address" value={form.address} onChangeText={(v) => setForm({ ...form, address: v })} multiline />
+    <View style={s.inputRow}><Field label="City" value={form.city} onChangeText={(v) => setForm({ ...form, city: v })} compact /><Field label="Pincode" value={form.pincode} onChangeText={(v) => setForm({ ...form, pincode: v.replace(/\D/g, '').slice(0, 6) })} compact /></View>
+    <Field label="Phone" value={form.phone} onChangeText={(v) => setForm({ ...form, phone: v.replace(/\D/g, '').slice(0, 10) })} />
+    <Primary label={saving ? 'Saving...' : 'Save Pharmacy Info'} onPress={save} disabled={saving} />
+  </FormCard>;
+}
+
+function StoreSettingsScreen() {
+  const [settings, setSettings] = useState<SellerSettings | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const load = useCallback(async () => {
+    setLoading(true); setError('');
+    try { const res = await sellerApi.settings(); setSettings(res.data ?? {}); }
+    catch (err) { setError(errorMessage(err)); }
+    finally { setLoading(false); }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+  function update(next: Partial<SellerSettings>) { setSettings((s0) => ({ ...(s0 ?? {}), ...next })); }
+  function updateStore(next: Record<string, unknown>) { setSettings((s0) => ({ ...(s0 ?? {}), settings: { ...(s0?.settings ?? {}), store: { ...(s0?.settings?.store ?? {}), ...next } } })); }
+  function updateNotif(next: Record<string, boolean>) { setSettings((s0) => ({ ...(s0 ?? {}), settings: { ...(s0?.settings ?? {}), notifications: { ...(s0?.settings?.notifications ?? {}), ...next } } })); }
+  async function save() {
+    const payload = {
+      ...(settings?.settings ?? {}),
+      is_open: settings?.is_open ? 1 : 0,
+    };
+    setSaving(true);
+    try { await sellerApi.saveSettings(payload); Alert.alert('Settings', 'Store settings saved'); await load(); }
+    catch (err) { Alert.alert('Settings', errorMessage(err)); }
+    finally { setSaving(false); }
+  }
+  if (loading) return <CenteredLoader compact />;
+  const store = settings?.settings?.store ?? {};
+  const n = settings?.settings?.notifications ?? {};
+  const auto = Boolean(store.auto_mode);
+  return <FormCard error={error} onRetry={load}>
+    <ToggleRow title="Open for customer orders" body="When off, customers cannot place new orders at this pharmacy." value={Boolean(settings?.is_open)} onValueChange={(v) => update({ is_open: v })} />
+    <ToggleRow title="Auto open / close" body="Use schedule instead of manual open state." value={auto} onValueChange={(v) => updateStore({ auto_mode: v })} />
+    <View style={s.inputRow}><Field label="Open from" value={store.open_time || '09:00'} onChangeText={(v) => updateStore({ open_time: v })} compact /><Field label="Close at" value={store.close_time || '21:00'} onChangeText={(v) => updateStore({ close_time: v })} compact /></View>
+    <SectionTitle title="Alerts" />
+    <ToggleRow title="Order sound alert" body="Ring for new orders until accepted." value={n.order_sound !== false} onValueChange={(v) => updateNotif({ order_sound: v })} />
+    <ToggleRow title="Vibrate" body="Use vibration for order alerts where supported." value={n.order_vibrate !== false} onValueChange={(v) => updateNotif({ order_vibrate: v })} />
+    <ToggleRow title="Popup banner" body="Show in-app new order popup." value={n.desktop_alert !== false} onValueChange={(v) => updateNotif({ desktop_alert: v })} />
+    <Primary label={saving ? 'Saving...' : 'Save Settings'} onPress={save} disabled={saving} />
+  </FormCard>;
+}
+
+function NotificationsScreen() {
+  const [items, setItems] = useState<SellerNotification[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [unreadOnly, setUnreadOnly] = useState(false);
+  const [error, setError] = useState('');
+  const load = useCallback(async () => {
+    setLoading(true); setError('');
+    try { const res = await sellerApi.notifications(unreadOnly); setItems(res.data?.items ?? []); }
+    catch (err) { setError(errorMessage(err)); }
+    finally { setLoading(false); }
+  }, [unreadOnly]);
+  useEffect(() => { load(); }, [load]);
+  async function markRead(id: number) { await sellerApi.markNotificationRead(id); load(); }
+  async function markAll() { await sellerApi.markAllNotificationsRead(); load(); }
+  return <>
+    <View style={s.rowBetween}><TouchableOpacity style={[s.smallChip, unreadOnly && { backgroundColor: C.ink }]} onPress={() => setUnreadOnly(!unreadOnly)}><Text style={[s.smallChipText, unreadOnly && { color: '#FFF' }]}>Unread only</Text></TouchableOpacity><Secondary label="Read all" compact onPress={markAll} /></View>
+    {loading ? <CenteredLoader compact /> : null}
+    {error ? <Notice tone="error" title="Could not load notifications" body={error} /> : null}
+    {items.map((n) => <TouchableOpacity key={n.id} style={s.card} onPress={() => markRead(n.id)}><View style={s.rowBetween}><Text style={s.itemTitle}>{n.title || n.category || 'Notification'}</Text>{n.is_read ? <Pill text="Read" /> : <Pill text="Unread" tone="orange" />}</View><Text style={s.muted}>{n.message || n.body || '-'}</Text><Text style={s.footer}>{prettyDate(n.created_at)}</Text></TouchableOpacity>)}
+    {!loading && !items.length ? <Empty title="No notifications" body="Admin approvals and platform alerts will appear here." /> : null}
+  </>;
+}
+
+function RxRequestsScreen() {
+  const [items, setItems] = useState<RxRequest[]>([]);
+  const [selected, setSelected] = useState<RxRequest | null>(null);
+  const [note, setNote] = useState('');
+  const [search, setSearch] = useState('');
+  const [results, setResults] = useState<Array<{ product_id: number; name: string; price?: number | null }>>([]);
+  const [cart, setCart] = useState<Array<{ product_id: number; name: string; quantity: number }>>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const load = useCallback(async () => {
+    setLoading(true); setError('');
+    try { const res = await sellerApi.rxRequests(); setItems(res.data?.items ?? []); }
+    catch (err) { setError(errorMessage(err)); }
+    finally { setLoading(false); }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+  async function searchCatalog(q: string) {
+    setSearch(q);
+    if (q.trim().length < 2) return setResults([]);
+    try { const res = await sellerApi.catalogSearch(q); setResults((res.data?.items ?? []).map((p) => ({ product_id: p.product_id, name: p.name, price: p.price }))); } catch { setResults([]); }
+  }
+  async function fillToCart() {
+    if (!selected || !cart.length) return Alert.alert('Rx', 'Search and add at least one catalog medicine.');
+    try { await sellerApi.rxRequestFillToCart({ request_id: selected.id, items: cart.map((i) => ({ product_id: i.product_id, quantity: i.quantity })), seller_notes: note }); Alert.alert('Rx', 'Medicines sent to customer cart'); setSelected(null); setCart([]); load(); }
+    catch (err) { Alert.alert('Rx', errorMessage(err)); }
+  }
+  async function reject() {
+    if (!selected) return;
+    try { await sellerApi.rxRequestReject({ request_id: selected.id, note }); Alert.alert('Rx', 'Request rejected'); setSelected(null); load(); }
+    catch (err) { Alert.alert('Rx', errorMessage(err)); }
+  }
+  async function message() {
+    if (!selected || !note.trim()) return Alert.alert('Rx', 'Enter a message first.');
+    try { await sellerApi.rxRequestSendMessage({ request_id: selected.id, message: note }); Alert.alert('Rx', 'Message sent'); }
+    catch (err) { Alert.alert('Rx', errorMessage(err)); }
+  }
+  if (selected) return <>
+    <TouchableOpacity onPress={() => setSelected(null)}><Text style={s.backText}>‹ Requests</Text></TouchableOpacity>
+    <View style={s.card}><Text style={s.itemTitle}>{selected.customer_name || 'Customer'} Rx</Text><Text style={s.muted}>{selected.status || '-'} • {prettyDate(selected.created_at)}</Text>{selected.prescription_url ? <Image source={{ uri: mediaUrl(selected.prescription_url) }} style={s.rxImage} resizeMode="contain" /> : null}</View>
+    <Field label="Message / seller notes" value={note} onChangeText={setNote} multiline />
+    <SearchBox placeholder="Search medicine from catalog" value={search} onChangeText={searchCatalog} />
+    {results.slice(0, 6).map((p) => <MenuItem key={p.product_id} title={p.name} body={money(p.price)} onPress={() => { setCart((c) => c.some((x) => x.product_id === p.product_id) ? c : [...c, { product_id: p.product_id, name: p.name, quantity: 1 }]); setResults([]); setSearch(''); }} />)}
+    {cart.map((c) => <View key={c.product_id} style={s.card}><View style={s.rowBetween}><Text style={s.itemTitle}>{c.name}</Text><TextInput style={s.qtyInput} value={String(c.quantity)} keyboardType="number-pad" onChangeText={(v) => setCart((list) => list.map((x) => x.product_id === c.product_id ? { ...x, quantity: Math.max(1, Number(v.replace(/\D/g, '') || 1)) } : x))} /></View></View>)}
+    <Primary label="Send Medicines To Customer Cart" onPress={fillToCart} />
+    <View style={s.inputRow}><Secondary label="Send Message" onPress={message} compact /><Danger label="Reject Rx" onPress={reject} compact /></View>
+  </>;
+  return <>
+    {loading ? <CenteredLoader compact /> : null}
+    {error ? <Notice tone="error" title="Could not load Rx requests" body={error} /> : null}
+    {items.map((rx) => <MenuItem key={rx.id} title={rx.customer_name || `Rx #${rx.id}`} body={`${rx.status || 'pending'} • ${prettyDate(rx.created_at)}`} badge={rx.status || undefined} onPress={() => { setSelected(rx); setNote(rx.notes || ''); }} />)}
+    {!loading && !items.length ? <Empty title="No open Rx requests" body="Customer prescription requests will appear here." /> : null}
+  </>;
+}
+
+function StockManagementScreen() {
+  const [view, setView] = useState('all');
+  const [items, setItems] = useState<InventoryItem[]>([]);
+  const [suggestions, setSuggestions] = useState<StockSuggestion[]>([]);
+  const [query, setQuery] = useState('');
+  const [loading, setLoading] = useState(true);
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [stock, sugg] = await Promise.all([sellerApi.stockManagement(view, query), sellerApi.stockSuggestions().catch(() => ({ data: { items: [] } }))]);
+      setItems(stock.data?.items ?? []);
+      setSuggestions(sugg.data?.items ?? []);
+    } catch (err) { Alert.alert('Stock', errorMessage(err)); }
+    finally { setLoading(false); }
+  }, [query, view]);
+  useEffect(() => { load(); }, [load]);
+  async function add(item: InventoryItem, qty: number) {
+    try { await sellerApi.addStock({ product_id: item.id, add_stock: qty, reason: 'Seller app stock add' }); load(); }
+    catch (err) { Alert.alert('Stock', errorMessage(err)); }
+  }
+  return <>
+    <SearchBox placeholder="Search stock" value={query} onChangeText={setQuery} />
+    <Segment<string> value={view} options={[['all', 'All'], ['low', 'Low'], ['out', 'Out'], ['suggested', 'Suggested']]} onChange={setView} />
+    {loading ? <CenteredLoader compact /> : null}
+    {suggestions.length ? <Notice tone="warn" title={`${suggestions.length} restock suggestions`} body={suggestions.slice(0, 3).map((x) => x.name || x.product_name).filter(Boolean).join(', ')} /> : null}
+    {items.map((item) => <View key={item.id} style={s.card}><View style={s.rowBetween}><View><Text style={s.itemTitle}>{item.name}</Text><Text style={s.muted}>{item.category_name || 'Catalog'} • {item.stock} in stock</Text></View><Text style={s.itemPrice}>{money(item.price)}</Text></View><View style={s.inputRow}><Secondary label="+10" onPress={() => add(item, 10)} compact /><Secondary label="+25" onPress={() => add(item, 25)} compact /><Danger label="Set 0" onPress={() => sellerApi.adjustStock({ product_id: item.id, action: 'set', quantity: 0, reason: 'Seller app adjustment' }).then(load).catch((err) => Alert.alert('Stock', errorMessage(err)))} compact /></View></View>)}
+    {!loading && !items.length ? <Empty title="No stock items" body="Add products from catalog or confirm orders to build stock." /> : null}
+  </>;
+}
+
+function VirtualShopScreen() {
+  const [data, setData] = useState<VirtualShopData | null>(null);
+  const [managed, setManaged] = useState(true);
+  const [discount, setDiscount] = useState('0');
+  const [loading, setLoading] = useState(true);
+  const load = useCallback(async () => {
+    setLoading(true);
+    try { const res = await sellerApi.virtualShop(); setData(res.data ?? {}); setManaged(Boolean(res.data?.managed_inventory ?? true)); }
+    catch (err) { Alert.alert('Virtual Shop', errorMessage(err)); }
+    finally { setLoading(false); }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+  async function save() {
+    try { await sellerApi.saveVirtualShop({ virtual_shop: { discount_pct: Number(discount || 0) }, managed_inventory: managed ? 1 : 0 }); Alert.alert('Virtual Shop', 'Virtual shop saved'); load(); }
+    catch (err) { Alert.alert('Virtual Shop', errorMessage(err)); }
+  }
+  if (loading) return <CenteredLoader compact />;
+  return <>
+    <View style={s.card}><Text style={s.itemTitle}>{data?.pharmacy?.name || 'My Store'}</Text><Text style={s.muted}>Listing status: {data?.listing_status || 'available through admin approval flow'}</Text></View>
+    <ToggleRow title="Managed inventory" body="Customers who choose My Store see your seller inventory." value={managed} onValueChange={setManaged} />
+    <Field label="Default shop discount %" value={discount} onChangeText={(v) => setDiscount(v.replace(/[^\d.]/g, ''))} />
+    <Primary label="Save Virtual Shop" onPress={save} />
+    <MenuItem title="Discount Rules" body="Loads seller discount rule data from backend" badge={Array.isArray(data?.discounts) ? String(data?.discounts.length) : undefined} onPress={() => sellerApi.discountRules().then((r) => Alert.alert('Discount rules', `${r.data?.items?.length ?? 0} rules found`)).catch((err) => Alert.alert('Discount rules', errorMessage(err)))} />
+  </>;
+}
+
+function PayoutsScreen() {
+  const today = new Date().toISOString().slice(0, 10);
+  const [items, setItems] = useState<PayoutOrder[]>([]);
+  const [wallet, setWallet] = useState<PayoutOrder[]>([]);
+  const [from, setFrom] = useState(today);
+  const [to, setTo] = useState(today);
+  const [loading, setLoading] = useState(true);
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [payouts, txns] = await Promise.all([sellerApi.payoutOrders(), sellerApi.walletTransactions(from, to).catch(() => ({ data: { items: [] } }))]);
+      setItems(payouts.data?.items ?? []);
+      setWallet(txns.data?.items ?? []);
+    } catch (err) { Alert.alert('Payouts', errorMessage(err)); }
+    finally { setLoading(false); }
+  }, [from, to]);
+  useEffect(() => { load(); }, [load]);
+  const total = items.reduce((sum, i) => sum + Number(i.seller_payout_amount ?? 0), 0);
+  return <>
+    <View style={s.statRow}><StatCard label="Payout rows" value={String(items.length)} /><StatCard label="Payout total" value={shortMoney(total)} warm /></View>
+    <View style={s.inputRow}><Field label="From" value={from} onChangeText={setFrom} compact /><Field label="To" value={to} onChangeText={setTo} compact /></View>
+    <Secondary label="Refresh Payouts" onPress={load} />
+    {loading ? <CenteredLoader compact /> : null}
+    {items.slice(0, 30).map((o) => <View key={o.id} style={s.card}><View style={s.rowBetween}><Text style={s.itemTitle}>{o.order_number || `Order #${o.id}`}</Text><Text style={s.itemPrice}>{money(o.seller_payout_amount)}</Text></View><Text style={s.muted}>{o.status || '-'} • Order value {money(o.total_amount)} • {prettyDate(o.created_at)}</Text></View>)}
+    <SectionTitle title="Wallet Transactions" right={`${wallet.length}`} />
+    {wallet.slice(0, 20).map((w, idx) => <Text key={`${w.id}-${idx}`} style={s.muted}>{w.order_number || `Txn ${idx + 1}`} • {money(w.total_amount ?? w.seller_payout_amount)} • {prettyDate(w.created_at)}</Text>)}
+  </>;
 }
 
 function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: DashboardData | null; onBack: () => void }) {
@@ -1579,6 +1906,28 @@ function Segment<T extends string>({ value, options, onChange, dark }: { value: 
   );
 }
 
+function FormCard({ children, error, onRetry }: { children: React.ReactNode; error?: string; onRetry?: () => void }) {
+  return (
+    <View style={s.card}>
+      {error ? <Notice tone="error" title="Could not load data" body={error} /> : null}
+      {error && onRetry ? <Secondary label="Retry" onPress={onRetry} /> : null}
+      {children}
+    </View>
+  );
+}
+
+function ToggleRow({ title, body, value, onValueChange }: { title: string; body: string; value: boolean; onValueChange: (value: boolean) => void }) {
+  return (
+    <View style={s.toggleRow}>
+      <View style={{ flex: 1 }}>
+        <Text style={s.itemTitle}>{title}</Text>
+        <Text style={s.muted}>{body}</Text>
+      </View>
+      <Switch value={value} onValueChange={onValueChange} />
+    </View>
+  );
+}
+
 function Field(props: React.ComponentProps<typeof TextInput> & { label: string; compact?: boolean }) {
   const { label, compact, style, ...rest } = props;
   return (
@@ -1605,8 +1954,8 @@ function Danger({ label, onPress, disabled, compact }: { label: string; onPress:
   return <TouchableOpacity disabled={disabled} style={[s.secondary, compact && s.compactButton, { borderColor: C.redSoft }]} onPress={onPress}><Text style={[s.secondaryText, { color: C.red }]}>{label}</Text></TouchableOpacity>;
 }
 
-function Pill({ text, tone }: { text: string; tone?: 'green' | 'blue' | 'red' | 'purple' }) {
-  const color = tone === 'green' ? [C.greenSoft, C.green] : tone === 'blue' ? [C.blueSoft, C.blue] : tone === 'red' ? [C.redSoft, C.red] : tone === 'purple' ? [C.purpleSoft, C.purple] : [C.beige, C.muted];
+function Pill({ text, tone }: { text: string; tone?: 'green' | 'blue' | 'red' | 'purple' | 'orange' }) {
+  const color = tone === 'green' ? [C.greenSoft, C.green] : tone === 'blue' ? [C.blueSoft, C.blue] : tone === 'red' ? [C.redSoft, C.red] : tone === 'purple' ? [C.purpleSoft, C.purple] : tone === 'orange' ? [C.orangeSoft, C.orange] : [C.beige, C.muted];
   return <View style={[s.pill, { backgroundColor: color[0] }]}><Text style={[s.pillText, { color: color[1] }]}>{text}</Text></View>;
 }
 
@@ -1742,6 +2091,7 @@ const s = StyleSheet.create({
   input: { minHeight: 56, borderRadius: 14, borderWidth: 1, borderColor: C.line, backgroundColor: '#FFF', paddingHorizontal: 14, color: C.ink, fontSize: 16 },
   inputCompact: { minHeight: 48 },
   inputRow: { flexDirection: 'row', gap: 10 },
+  toggleRow: { minHeight: 76, borderRadius: 16, borderWidth: 1, borderColor: C.line, backgroundColor: '#FFF', padding: 14, flexDirection: 'row', alignItems: 'center', gap: 12 },
   primary: { minHeight: 56, borderRadius: 14, backgroundColor: C.ink, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 14 },
   primaryText: { color: '#FFF', fontSize: 16, fontWeight: '900' },
   secondary: { minHeight: 50, borderRadius: 14, borderWidth: 1, borderColor: C.line, backgroundColor: '#FFF', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 14 },
