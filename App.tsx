@@ -1,12 +1,18 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as BackgroundFetch from 'expo-background-fetch';
+import * as Notifications from 'expo-notifications';
 import { StatusBar } from 'expo-status-bar';
+import * as TaskManager from 'expo-task-manager';
 import { jwtDecode } from 'jwt-decode';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  AppState,
+  BackHandler,
   Image,
   Modal,
+  Platform,
   Pressable,
   RefreshControl,
   ScrollView,
@@ -51,6 +57,16 @@ const C = {
 
 const SESSION_KEY = 'zepmed:seller:session';
 const PREF_KEY = 'zepmed:seller:prefs';
+const PENDING_NOTIFICATIONS_KEY = 'zepmed:seller:pending-notifications';
+const ORDER_POLL_TASK = 'zepmed-seller-order-poll';
+
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowAlert: true,
+    shouldPlaySound: true,
+    shouldSetBadge: true,
+  }),
+});
 
 type ApiWrap<T> = { success: boolean; data?: T | null; message?: string | null };
 type AuthSession = {
@@ -194,6 +210,7 @@ type DailySalesReport = {
 type TabKey = 'home' | 'orders' | 'catalog' | 'wholesale' | 'more';
 type AuthTab = 'password' | 'otp' | 'register';
 type OrderFilter = 'all' | 'pending' | 'rx' | 'preparing' | 'ready' | 'delivered';
+type DashboardTarget = 'orders' | 'pending' | 'revenue' | 'delivered';
 
 function cleanMobile(raw: string) {
   let mobile = raw.replace(/\D/g, '');
@@ -289,7 +306,13 @@ function errorMessage(err: unknown) {
   const msg = err instanceof Error ? err.message : String(err);
   if (/network request failed|unable to resolve|failed to fetch/i.test(msg)) return 'Cannot reach ZepMed. Check internet and try again.';
   if (/timeout|timed out/i.test(msg)) return 'Connection timed out. Try again.';
+  if (/server error \(502\)|bad gateway|http 502/i.test(msg)) return 'ZepMed server gateway error (502). The backend is temporarily unavailable; retry in a moment.';
+  if (/server error \(503\)|server error \(504\)/i.test(msg)) return 'ZepMed server is temporarily unavailable. Retry in a moment.';
   return msg || 'Something went wrong.';
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function persistAuth(data: AuthSession) {
@@ -305,30 +328,178 @@ async function persistAuth(data: AuthSession) {
   });
 }
 
-async function request<T>(path: string, options: { auth?: boolean; method?: 'GET' | 'POST'; body?: unknown; query?: Record<string, string | number | boolean | null | undefined> } = {}): Promise<ApiWrap<T>> {
+async function refreshAccessToken() {
+  const session = await readSession();
+  if (!session.refreshToken) return false;
+  try {
+    const response = await fetch(`${API.authBaseUrl}/auth/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token: session.refreshToken }),
+    });
+    const json = (await response.json()) as ApiWrap<AuthSession>;
+    if (!response.ok || !json.success || !json.data?.access_token) return false;
+    await persistAuth(json.data);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureFreshToken() {
+  const session = await readSession();
+  if (!session.accessToken) return;
+  const expiry = session.tokenExpiresAt ?? 0;
+  if (!expiry || Date.now() >= expiry - 120_000) await refreshAccessToken();
+}
+
+async function request<T>(
+  path: string,
+  options: { auth?: boolean; method?: 'GET' | 'POST'; body?: unknown; query?: Record<string, string | number | boolean | null | undefined>; retry?: boolean } = {},
+): Promise<ApiWrap<T>> {
   const params = new URLSearchParams();
   Object.entries(options.query ?? {}).forEach(([k, v]) => {
     if (v !== null && v !== undefined && v !== '') params.append(k, String(v));
   });
-  const base = options.auth ? API.authBaseUrl : API.phpBaseUrl;
-  const url = `${base}/${path.replace(/^\/+/, '')}${params.toString() ? `?${params}` : ''}`;
+  if (!options.auth) await ensureFreshToken();
   const session = await readSession();
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (!options.auth && session.accessToken) headers.Authorization = `Bearer ${session.accessToken.replace(/^bearer\s+/i, '')}`;
 
-  const response = await fetch(url, {
-    method: options.method ?? (options.body ? 'POST' : 'GET'),
-    headers,
-    body: options.body ? JSON.stringify(options.body) : undefined,
-  });
-  let json: ApiWrap<T>;
-  try {
-    json = (await response.json()) as ApiWrap<T>;
-  } catch {
-    json = { success: response.ok, message: response.statusText, data: null };
+  const bases = options.auth
+    ? [API.authBaseUrl, API.authFallbackBaseUrl, API.authLegacyBaseUrl]
+    : [API.phpBaseUrl];
+  let lastError: unknown;
+
+  for (let idx = 0; idx < bases.length; idx += 1) {
+    const url = `${bases[idx]}/${path.replace(/^\/+/, '')}${params.toString() ? `?${params}` : ''}`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 18000);
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: options.method ?? (options.body ? 'POST' : 'GET'),
+        headers,
+        body: options.body ? JSON.stringify(options.body) : undefined,
+        signal: controller.signal,
+      });
+    } catch (err) {
+      lastError = err;
+      if (options.auth && idx < bases.length - 1) continue;
+      throw err;
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (response.status === 401 && !options.auth && options.retry !== false) {
+      const refreshed = await refreshAccessToken();
+      if (refreshed) return request<T>(path, { ...options, retry: false });
+      await saveSession({});
+    }
+    let json: ApiWrap<T>;
+    try {
+      json = (await response.json()) as ApiWrap<T>;
+    } catch {
+      json = { success: response.ok, message: response.statusText, data: null };
+    }
+    if (response.ok && json.success !== false) return json;
+
+    const err = new Error(json.message || `Server error (${response.status})`);
+    lastError = err;
+    if (options.auth && [404, 502, 503, 504].includes(response.status) && idx < bases.length - 1) continue;
+    if (!options.auth && options.retry !== false && [502, 503, 504].includes(response.status)) {
+      await delay(900);
+      return request<T>(path, { ...options, retry: false });
+    }
+    throw err;
   }
-  if (!response.ok || json.success === false) throw new Error(json.message || `Server error (${response.status})`);
-  return json;
+  throw lastError instanceof Error ? lastError : new Error('Something went wrong.');
+}
+
+async function readNotificationMap(): Promise<Record<string, string>> {
+  const raw = await AsyncStorage.getItem(PENDING_NOTIFICATIONS_KEY);
+  return raw ? JSON.parse(raw) : {};
+}
+
+async function writeNotificationMap(value: Record<string, string>) {
+  await AsyncStorage.setItem(PENDING_NOTIFICATIONS_KEY, JSON.stringify(value));
+}
+
+async function readPrefs() {
+  const raw = await AsyncStorage.getItem(PREF_KEY);
+  const parsed = raw ? JSON.parse(raw) as { sound?: boolean; autoPrint?: boolean } : {};
+  return { sound: parsed.sound ?? true, autoPrint: parsed.autoPrint ?? false };
+}
+
+async function ensureNotificationReady() {
+  if (Platform.OS === 'android') {
+    await Notifications.setNotificationChannelAsync('order-alerts', {
+      name: 'Order alerts',
+      importance: Notifications.AndroidImportance.MAX,
+      vibrationPattern: [0, 400, 150, 400, 150, 500],
+      sound: 'default',
+      lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
+    });
+  }
+  const existing = await Notifications.getPermissionsAsync();
+  if (!existing.granted) {
+    const requested = await Notifications.requestPermissionsAsync();
+    return requested.granted;
+  }
+  return true;
+}
+
+async function schedulePendingOrderNotification(order: Order, existing: Record<string, string>) {
+  const key = String(order.id);
+  if (existing[key]) return existing;
+  const ok = await ensureNotificationReady();
+  if (!ok) return existing;
+  const id = await Notifications.scheduleNotificationAsync({
+    content: {
+      title: `New order pending ${order.order_number}`,
+      body: `${order.customer_name || 'Customer'} • ${money(order.total_amount)}. Tap to open and accept.`,
+      sound: 'default',
+      data: { orderId: order.id },
+      priority: Notifications.AndroidNotificationPriority.MAX,
+    },
+    trigger: { seconds: 20, repeats: true, channelId: 'order-alerts' } as Notifications.NotificationTriggerInput,
+  });
+  return { ...existing, [key]: id };
+}
+
+async function syncPendingOrderNotifications(orders: Order[]) {
+  const prefs = await readPrefs();
+  const current = await readNotificationMap();
+  const pendingIds = new Set(orders.filter((order) => pendingStatus(order.status)).map((order) => String(order.id)));
+  let next = { ...current };
+
+  if (!prefs.sound) {
+    await Promise.all(Object.values(next).map((id) => Notifications.cancelScheduledNotificationAsync(id).catch(() => undefined)));
+    await writeNotificationMap({});
+    await Notifications.setBadgeCountAsync(0).catch(() => undefined);
+    return;
+  }
+
+  for (const [orderId, notificationId] of Object.entries(current)) {
+    if (!pendingIds.has(orderId)) {
+      await Notifications.cancelScheduledNotificationAsync(notificationId).catch(() => undefined);
+      delete next[orderId];
+    }
+  }
+
+  for (const order of orders.filter((item) => pendingStatus(item.status))) {
+    next = await schedulePendingOrderNotification(order, next);
+  }
+
+  await writeNotificationMap(next);
+  await Notifications.setBadgeCountAsync(pendingIds.size).catch(() => undefined);
+}
+
+async function cancelOrderNotification(orderId: number) {
+  const map = await readNotificationMap();
+  const id = map[String(orderId)];
+  if (id) await Notifications.cancelScheduledNotificationAsync(id).catch(() => undefined);
+  delete map[String(orderId)];
+  await writeNotificationMap(map);
 }
 
 const authApi = {
@@ -402,6 +573,44 @@ const sellerApi = {
   subscribePlan: (planId: number) => request<SubscriptionInfo>('seller/subscription/subscribe', { body: { plan_id: planId, payment_method: 'demo', demo_card: '4242 4242 4242 4242', simulate: 'success' } }),
 };
 
+TaskManager.defineTask(ORDER_POLL_TASK, async () => {
+  try {
+    const session = await readSession();
+    if (!session.accessToken) return BackgroundFetch.BackgroundFetchResult.NoData;
+    const prefs = await readPrefs();
+    if (!prefs.sound) {
+      await syncPendingOrderNotifications([]);
+      return BackgroundFetch.BackgroundFetchResult.NoData;
+    }
+    const response = await sellerApi.orders();
+    const orders = response.data?.items ?? [];
+    await syncPendingOrderNotifications(orders);
+    return orders.some((order) => pendingStatus(order.status))
+      ? BackgroundFetch.BackgroundFetchResult.NewData
+      : BackgroundFetch.BackgroundFetchResult.NoData;
+  } catch {
+    return BackgroundFetch.BackgroundFetchResult.Failed;
+  }
+});
+
+async function registerOrderBackgroundTask() {
+  try {
+    await ensureNotificationReady();
+    const status = await BackgroundFetch.getStatusAsync();
+    if (status === BackgroundFetch.BackgroundFetchStatus.Restricted || status === BackgroundFetch.BackgroundFetchStatus.Denied) return;
+    const registered = await TaskManager.isTaskRegisteredAsync(ORDER_POLL_TASK);
+    if (!registered) {
+      await BackgroundFetch.registerTaskAsync(ORDER_POLL_TASK, {
+        minimumInterval: 60,
+        stopOnTerminate: false,
+        startOnBoot: true,
+      });
+    }
+  } catch {
+    // Background fetch availability differs by device and Android battery policy.
+  }
+}
+
 export default function App() {
   return (
     <SafeAreaProvider>
@@ -447,8 +656,8 @@ function Splash() {
   );
 }
 
-function CenteredLoader() {
-  return <View style={s.center}><ActivityIndicator color={C.orange} /></View>;
+function CenteredLoader({ compact = false }: { compact?: boolean }) {
+  return <View style={compact ? s.centerCompact : s.center}><ActivityIndicator color={C.orange} /></View>;
 }
 
 function AuthScreen({ onDone }: { onDone: () => void }) {
@@ -526,6 +735,7 @@ function AuthScreen({ onDone }: { onDone: () => void }) {
 function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
   const insets = useSafeAreaInsets();
   const [tab, setTab] = useState<TabKey>('home');
+  const [orderFilter, setOrderFilter] = useState<OrderFilter>('all');
   const [dash, setDash] = useState<DashboardData | null>(null);
   const [orders, setOrders] = useState<Order[]>([]);
   const [inventory, setInventory] = useState<InventoryItem[]>([]);
@@ -536,34 +746,70 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
   const [showReport, setShowReport] = useState(false);
   const [fresh, setFresh] = useState<Order | null>(null);
   const knownOrders = useRef<Set<number>>(new Set());
+  const refreshInFlight = useRef(false);
+  const tabHistory = useRef<TabKey[]>([]);
 
   const canWholesale = dash?.plan_features?.features?.includes('wholesale') || dash?.is_wholeseller === true;
 
+  const goTab = useCallback((next: TabKey, filter?: OrderFilter) => {
+    if (filter) setOrderFilter(filter);
+    setTab((current) => {
+      if (current !== next) tabHistory.current.push(current);
+      return next;
+    });
+  }, []);
+
   const refresh = useCallback(async (silent = false) => {
+    if (refreshInFlight.current) return;
+    refreshInFlight.current = true;
     if (!silent) setRefreshing(true);
     setError('');
+    let nextError = '';
     try {
-      const [d, o] = await Promise.all([sellerApi.dashboard(), sellerApi.orders()]);
-      setDash(d.data ?? null);
-      const next = (o.data?.items ?? []).sort((a, b) => (b.created_at ?? '').localeCompare(a.created_at ?? '') || b.id - a.id);
+      try {
+        const d = await sellerApi.dashboard();
+        setDash(d.data ?? null);
+      } catch (err) {
+        nextError = errorMessage(err);
+      }
+
+      let next: Order[] = [];
+      try {
+        const o = await sellerApi.orders();
+        next = (o.data?.items ?? []).sort((a, b) => (b.created_at ?? '').localeCompare(a.created_at ?? '') || b.id - a.id);
+      } catch (err) {
+        nextError = nextError || errorMessage(err);
+      }
+
       const firstFresh = next.find((order) => !knownOrders.current.has(order.id) && pendingStatus(order.status));
       if (knownOrders.current.size && firstFresh) {
         setFresh(firstFresh);
         Vibration.vibrate([0, 300, 120, 300]);
-        setTab('orders');
+        goTab('orders', 'pending');
+      } else if (!knownOrders.current.size) {
+        const firstPending = next.find((order) => pendingStatus(order.status));
+        if (firstPending) setFresh(firstPending);
       }
       knownOrders.current = new Set(next.map((order) => order.id));
       setOrders(next);
+      await syncPendingOrderNotifications(next);
+
       if (tab === 'home' || tab === 'catalog') {
-        const inv = await sellerApi.inventory();
-        setInventory(inv.data?.items ?? []);
+        try {
+          const inv = await sellerApi.inventory();
+          setInventory(inv.data?.items ?? []);
+        } catch (err) {
+          if (!inventory.length) nextError = nextError || errorMessage(err);
+        }
       }
+      if (nextError) setError(nextError);
     } catch (err) {
       setError(errorMessage(err));
     } finally {
       setRefreshing(false);
+      refreshInFlight.current = false;
     }
-  }, [tab]);
+  }, [goTab, inventory.length, tab]);
 
   useEffect(() => {
     refresh(true);
@@ -571,7 +817,49 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
     return () => clearInterval(timer);
   }, [refresh]);
 
+  useEffect(() => {
+    registerOrderBackgroundTask().catch(() => undefined);
+    const sub = Notifications.addNotificationResponseReceivedListener((response) => {
+      const orderId = Number(response.notification.request.content.data?.orderId || 0);
+      if (orderId) openOrder(orderId);
+    });
+    const appSub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') refresh(true);
+    });
+    return () => {
+      sub.remove();
+      appSub.remove();
+    };
+  }, [refresh]);
+
+  useEffect(() => {
+    const sub = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (selectedOrder) {
+        setSelectedOrder(null);
+        refresh(true);
+        return true;
+      }
+      if (showReport) {
+        setShowReport(false);
+        return true;
+      }
+      const previous = tabHistory.current.pop();
+      if (previous && previous !== tab) {
+        setTab(previous);
+        return true;
+      }
+      if (tab !== 'home') {
+        setTab('home');
+        return true;
+      }
+      return false;
+    });
+    return () => sub.remove();
+  }, [refresh, selectedOrder, showReport, tab]);
+
   async function openOrder(id: number) {
+    const seed = orders.find((order) => order.id === id);
+    if (seed) setSelectedOrder(seed as OrderDetail);
     try {
       const detail = await sellerApi.orderDetail(id);
       setSelectedOrder(detail.data ?? null);
@@ -583,10 +871,20 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
   async function action(orderId: number, code: string) {
     try {
       await sellerApi.orderAction(orderId, code);
+      await cancelOrderNotification(orderId);
       await refresh(true);
     } catch (err) {
       Alert.alert('Action failed', errorMessage(err));
     }
+  }
+
+  function openDashboardTarget(target: DashboardTarget) {
+    if (target === 'revenue') {
+      setShowReport(true);
+      return;
+    }
+    const nextFilter: OrderFilter = target === 'pending' ? 'pending' : target === 'delivered' ? 'delivered' : 'all';
+    goTab('orders', nextFilter);
   }
 
   if (selectedOrder) return <OrderDetailScreen order={selectedOrder} dash={dash} onBack={() => { setSelectedOrder(null); refresh(true); }} />;
@@ -603,14 +901,15 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
       <ScrollView refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => refresh()} tintColor={C.orange} />} contentContainerStyle={s.body}>
         {fresh && tab === 'orders' ? <FreshBanner order={fresh} onClose={() => setFresh(null)} onOpen={() => openOrder(fresh.id)} /> : null}
         {error ? <Notice tone="error" title={error} /> : null}
-        {tab === 'home' ? <HomeScreen dash={dash} orders={orders} onOpenOrder={openOrder} onAction={action} /> : null}
-        {tab === 'orders' ? <OrdersScreen orders={orders} onOpenOrder={openOrder} onAction={action} /> : null}
-        {tab === 'catalog' ? <CatalogScreen items={inventory} onEdit={setEditItem} onWholesale={() => setTab('wholesale')} /> : null}
+        {tab === 'home' ? <HomeScreen dash={dash} orders={orders} onOpenOrder={openOrder} onAction={action} onDashboardTarget={openDashboardTarget} /> : null}
+        {tab === 'orders' ? <OrdersScreen orders={orders} filter={orderFilter} onFilter={setOrderFilter} onOpenOrder={openOrder} onAction={action} /> : null}
+        {tab === 'catalog' ? <CatalogScreen items={inventory} onEdit={setEditItem} onWholesale={() => goTab('wholesale')} /> : null}
         {tab === 'wholesale' ? <WholesaleScreen dash={dash} canWholesale={Boolean(canWholesale)} onRefresh={() => refresh(true)} /> : null}
         {tab === 'more' ? <MoreScreen dash={dash} onReport={() => setShowReport(true)} onRefresh={() => refresh()} /> : null}
       </ScrollView>
-      <BottomTabs current={tab} setTab={setTab} pending={orders.filter((o) => pendingStatus(o.status)).length} showWholesale={Boolean(canWholesale)} />
+      <BottomTabs current={tab} setTab={goTab} pending={orders.filter((o) => pendingStatus(o.status)).length} showWholesale={Boolean(canWholesale)} />
       <StockEditModal item={editItem} onClose={() => setEditItem(null)} onSaved={() => { setEditItem(null); refresh(true); }} />
+      <NewOrderPopup order={fresh} onClose={() => setFresh(null)} onOpen={() => { const order = fresh; setFresh(null); if (order) openOrder(order.id); }} />
     </View>
   );
 }
@@ -628,7 +927,19 @@ function Header({ title, subtitle, onRefresh, onLogout }: { title: string; subti
   );
 }
 
-function HomeScreen({ dash, orders, onOpenOrder, onAction }: { dash: DashboardData | null; orders: Order[]; onOpenOrder: (id: number) => void; onAction: (id: number, code: string) => void }) {
+function HomeScreen({
+  dash,
+  orders,
+  onOpenOrder,
+  onAction,
+  onDashboardTarget,
+}: {
+  dash: DashboardData | null;
+  orders: Order[];
+  onOpenOrder: (id: number) => void;
+  onAction: (id: number, code: string) => void;
+  onDashboardTarget: (target: DashboardTarget) => void;
+}) {
   if (!dash) return <CenteredLoader />;
   return (
     <>
@@ -641,10 +952,10 @@ function HomeScreen({ dash, orders, onOpenOrder, onAction }: { dash: DashboardDa
           <Pill text="Live" tone="green" />
         </View>
         <View style={s.kpiGrid}>
-          <Kpi label="Orders" value={String(dash.orders_total ?? 0)} />
-          <Kpi label="Pending" value={String(dash.pending_dispatch ?? 0)} />
-          <Kpi label="Revenue" value={shortMoney(dash.revenue_total)} />
-          <Kpi label="Delivered" value={String(dash.delivered_count ?? 0)} />
+          <Kpi label="Orders" value={String(dash.orders_total ?? 0)} tone="blue" onPress={() => onDashboardTarget('orders')} />
+          <Kpi label="Pending" value={String(dash.pending_dispatch ?? 0)} tone="orange" onPress={() => onDashboardTarget('pending')} />
+          <Kpi label="Revenue" value={shortMoney(dash.revenue_total)} tone="green" onPress={() => onDashboardTarget('revenue')} />
+          <Kpi label="Delivered" value={String(dash.delivered_count ?? 0)} tone="purple" onPress={() => onDashboardTarget('delivered')} />
         </View>
       </View>
       <View style={[s.infoCard, { backgroundColor: C.blueSoft }]}>
@@ -664,8 +975,19 @@ function HomeScreen({ dash, orders, onOpenOrder, onAction }: { dash: DashboardDa
   );
 }
 
-function OrdersScreen({ orders, onOpenOrder, onAction }: { orders: Order[]; onOpenOrder: (id: number) => void; onAction: (id: number, code: string) => void }) {
-  const [filter, setFilter] = useState<OrderFilter>('all');
+function OrdersScreen({
+  orders,
+  filter,
+  onFilter,
+  onOpenOrder,
+  onAction,
+}: {
+  orders: Order[];
+  filter: OrderFilter;
+  onFilter: (filter: OrderFilter) => void;
+  onOpenOrder: (id: number) => void;
+  onAction: (id: number, code: string) => void;
+}) {
   const [query, setQuery] = useState('');
   const filtered = useMemo(() => {
     const statusMap: Record<OrderFilter, string[] | null> = {
@@ -689,7 +1011,7 @@ function OrdersScreen({ orders, onOpenOrder, onAction }: { orders: Order[]; onOp
       <Segment<OrderFilter>
         value={filter}
         options={[['all', 'All'], ['pending', 'Pending'], ['rx', 'Prescription'], ['preparing', 'Preparing'], ['ready', 'Ready'], ['delivered', 'Delivered']]}
-        onChange={setFilter}
+        onChange={onFilter}
         dark
       />
       <Text style={s.count}>{filtered.length} orders</Text>
@@ -751,43 +1073,78 @@ function WholesaleScreen({ dash, canWholesale, onRefresh }: { dash: DashboardDat
   const [selected, setSelected] = useState<WholesellerPharmacy | null>(null);
   const [qty, setQty] = useState<Record<number, string>>({});
   const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState('');
+  const [catalogLoading, setCatalogLoading] = useState(false);
+  const [catalogError, setCatalogError] = useState('');
 
   const load = useCallback(async () => {
     setLoading(true);
-    try {
-      if (canWholesale) {
-        const [w, mine] = await Promise.all([sellerApi.wholesellers(), sellerApi.wholesaleOrders('buyer')]);
+    setLoadError('');
+    const problems: string[] = [];
+    if (canWholesale) {
+      try {
+        const w = await sellerApi.wholesellers();
         setWholesellers(w.data?.items ?? []);
-        setMyOrders(mine.data?.items ?? []);
+      } catch (err) {
+        setWholesellers([]);
+        problems.push(`Wholesellers: ${errorMessage(err)}`);
       }
-      if (dash?.is_wholeseller) {
+      try {
+        const mine = await sellerApi.wholesaleOrders('buyer');
+        setMyOrders(mine.data?.items ?? []);
+      } catch (err) {
+        setMyOrders([]);
+        problems.push(`Purchase orders: ${errorMessage(err)}`);
+      }
+    } else {
+      setWholesellers([]);
+      setMyOrders([]);
+    }
+    if (dash?.is_wholeseller) {
+      try {
         const inc = await sellerApi.wholesaleOrders('wholeseller');
         setIncoming(inc.data?.items ?? []);
+      } catch (err) {
+        setIncoming([]);
+        problems.push(`Incoming orders: ${errorMessage(err)}`);
       }
-    } catch (err) {
-      Alert.alert('Wholesale', errorMessage(err));
-    } finally {
-      setLoading(false);
+    } else {
+      setIncoming([]);
     }
+    if (problems.length) setLoadError(problems.join('\n'));
+    setLoading(false);
   }, [canWholesale, dash?.is_wholeseller]);
 
   useEffect(() => { load(); }, [load]);
 
   async function openCatalog(w: WholesellerPharmacy) {
     setSelected(w);
+    setCatalog([]);
     setQty({});
-    const res = await sellerApi.wholesaleCatalog(w.id);
-    setCatalog(res.data?.items ?? []);
+    setCatalogError('');
+    setCatalogLoading(true);
+    try {
+      const res = await sellerApi.wholesaleCatalog(w.id);
+      setCatalog(res.data?.items ?? []);
+    } catch (err) {
+      setCatalogError(errorMessage(err));
+    } finally {
+      setCatalogLoading(false);
+    }
   }
 
   async function placeOrder() {
     if (!selected) return;
     const lines = Object.entries(qty).map(([id, value]) => ({ product_id: Number(id), quantity: Number(value), quantity_unit: 'strip' })).filter((line) => line.quantity > 0);
     if (!lines.length) return Alert.alert('Wholesale', 'Enter quantity for at least one item.');
-    await sellerApi.createWholesaleOrder({ wholeseller_pharmacy_id: selected.id, items: lines, notes: '' });
-    setSelected(null);
-    onRefresh();
-    load();
+    try {
+      await sellerApi.createWholesaleOrder({ wholeseller_pharmacy_id: selected.id, items: lines, notes: '' });
+      setSelected(null);
+      onRefresh();
+      load();
+    } catch (err) {
+      Alert.alert('Wholesale', errorMessage(err));
+    }
   }
 
   if (!canWholesale && !dash?.is_wholeseller) {
@@ -798,6 +1155,8 @@ function WholesaleScreen({ dash, canWholesale, onRefresh }: { dash: DashboardDat
       <>
         <TouchableOpacity onPress={() => setSelected(null)}><Text style={s.backText}>‹ Back</Text></TouchableOpacity>
         <SectionTitle title={selected.name} right={selected.city || ''} />
+        {catalogLoading ? <CenteredLoader compact /> : null}
+        {catalogError ? <Notice tone="error" title="Could not load catalog" body={catalogError} /> : null}
         {catalog.map((item) => (
           <View key={item.id} style={s.card}>
             <View style={s.rowBetween}>
@@ -809,20 +1168,27 @@ function WholesaleScreen({ dash, canWholesale, onRefresh }: { dash: DashboardDat
             </View>
           </View>
         ))}
-        <Primary label="Place Purchase Order" onPress={placeOrder} />
+        {!catalogLoading && !catalogError && !catalog.length ? <Empty title="No products" body="This wholeseller has no catalog items available right now." /> : null}
+        {catalogError ? <Secondary label="Retry catalog" onPress={() => openCatalog(selected)} /> : null}
+        {catalog.length ? <Primary label="Place Purchase Order" onPress={placeOrder} /> : null}
       </>
     );
   }
   return (
     <>
       {loading ? <ActivityIndicator color={C.orange} /> : null}
+      {loadError ? <Notice tone="error" title="Wholesale sync issue" body={loadError} /> : null}
+      {loadError ? <Secondary label="Retry wholesale" onPress={load} /> : null}
       {(dash?.inventory_low_stock ?? 0) > 0 ? <Notice tone="warn" title={`${dash?.inventory_low_stock} products low on stock`} body="Purchase from a nearby wholeseller below." /> : null}
       {canWholesale ? <SectionTitle title="Nearby Wholesellers" /> : null}
       {wholesellers.map((w) => <MenuItem key={w.id} title={w.name} body={`${w.city || '-'} • ${w.pincode || '-'} • ${w.catalog_count ?? 0} products`} badge={w.distance_label || (w.pincode_match ? 'Same pincode' : w.city_match ? 'Same city' : undefined)} onPress={() => openCatalog(w)} />)}
+      {!loading && canWholesale && !wholesellers.length ? <Empty title="No wholesalers" body="No nearby wholesellers are available, or the server did not return this list." /> : null}
       {canWholesale ? <SectionTitle title="My Purchase Orders" /> : null}
       {myOrders.slice(0, 10).map((o) => <WholesaleOrderCard key={o.id} order={o} />)}
+      {!loading && canWholesale && !myOrders.length ? <Text style={s.muted}>No B2B purchase orders yet.</Text> : null}
       {dash?.is_wholeseller ? <SectionTitle title="Incoming Orders" /> : null}
       {incoming.slice(0, 10).map((o) => <WholesaleOrderCard key={o.id} order={o} action={(code) => sellerApi.wholesaleAction(o.id, code).then(load)} />)}
+      {!loading && dash?.is_wholeseller && !incoming.length ? <Text style={s.muted}>No incoming wholesale orders yet.</Text> : null}
     </>
   );
 }
@@ -850,6 +1216,7 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
     setActing(true);
     try {
       await sellerApi.orderAction(detail.id, code);
+      await cancelOrderNotification(detail.id);
       await reload();
       if (code === 'ready_for_pickup') onBack();
     } catch (err) {
@@ -868,6 +1235,7 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
         final_status: finalStatus,
         items: (detail.items ?? []).map((item) => ({ order_item_id: item.id, fulfill_qty: Number(fulfill[item.id] || 0), forward_qty: 0, forward_to_pharmacy_id: 0 })),
       });
+      await cancelOrderNotification(detail.id);
       await reload();
       if (finalStatus === 'ready_for_pickup' || finalStatus === 'rejected') onBack();
     } catch (err) {
@@ -883,6 +1251,7 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
     setActing(true);
     try {
       const res = await sellerApi.prescriptionFill({ order_id: detail.id, items, seller_notes: notes, final_status: 'confirmed' });
+      await cancelOrderNotification(detail.id);
       if (res.data) setDetail(res.data);
     } catch (err) {
       Alert.alert('Prescription', errorMessage(err));
@@ -1037,6 +1406,7 @@ function SettingsPanel() {
     setSound(value.sound);
     setAutoPrint(value.autoPrint);
     AsyncStorage.setItem(PREF_KEY, JSON.stringify(value));
+    if (!value.sound) syncPendingOrderNotifications([]).catch(() => undefined);
   }
   return (
     <>
@@ -1142,6 +1512,24 @@ function FreshBanner({ order, onOpen, onClose }: { order: Order; onOpen: () => v
   );
 }
 
+function NewOrderPopup({ order, onOpen, onClose }: { order: Order | null; onOpen: () => void; onClose: () => void }) {
+  return (
+    <Modal visible={Boolean(order)} transparent animationType="fade" onRequestClose={onClose}>
+      <View style={s.modalShade}>
+        <View style={s.newOrderModal}>
+          <View style={s.zTile}><Text style={s.zText}>Z+</Text></View>
+          <Text style={s.newOrderTitle}>New order received</Text>
+          <Text style={s.newOrderNo}>{order?.order_number}</Text>
+          <Text style={s.newOrderBody}>{order?.customer_name || 'Customer'} • {money(order?.total_amount)}</Text>
+          <Text style={s.newOrderHint}>Notifications will continue until this order is accepted or moved out of pending.</Text>
+          <Primary label="Open order" onPress={onOpen} />
+          <Secondary label="Later" onPress={onClose} />
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
 function VirtualShopBanner({ order, compact }: { order: Pick<Order, 'virtual_shop_label' | 'preferred_pharmacy_name' | 'shop_order_discount' | 'routing_notes' | 'customer_shop_mode'>; compact?: boolean }) {
   return (
     <View style={[s.virtualBanner, compact && { marginVertical: 8 }]}>
@@ -1226,8 +1614,21 @@ function SectionTitle({ title, right }: { title: string; right?: string }) {
   return <View style={s.sectionTitle}><Text style={s.sectionText}>{title}</Text>{right ? <Text style={s.sectionRight}>{right}</Text> : null}</View>;
 }
 
-function Kpi({ label, value }: { label: string; value: string }) {
-  return <View style={s.kpi}><Text style={s.kpiLabel}>{label}</Text><Text style={s.kpiValue}>{value}</Text></View>;
+function Kpi({ label, value, tone, onPress }: { label: string; value: string; tone?: 'blue' | 'orange' | 'green' | 'purple'; onPress?: () => void }) {
+  const palette = tone === 'green'
+    ? [C.greenSoft, C.green]
+    : tone === 'purple'
+      ? [C.purpleSoft, C.purple]
+      : tone === 'orange'
+        ? [C.orangeSoft, C.orange]
+        : [C.blueSoft, C.blue];
+  return (
+    <TouchableOpacity activeOpacity={0.82} disabled={!onPress} style={[s.kpi, { backgroundColor: palette[0] }]} onPress={onPress}>
+      <Text style={[s.kpiLabel, { color: palette[1] }]}>{label}</Text>
+      <Text style={s.kpiValue}>{value}</Text>
+      <Text style={[s.kpiArrow, { color: palette[1] }]}>›</Text>
+    </TouchableOpacity>
+  );
 }
 
 function StatCard({ label, value, warm }: { label: string; value: string; warm?: boolean }) {
@@ -1266,6 +1667,7 @@ function OrderStepper({ status }: { status: string }) {
 const s = StyleSheet.create({
   screen: { flex: 1, backgroundColor: C.bg },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: C.bg },
+  centerCompact: { minHeight: 120, alignItems: 'center', justifyContent: 'center' },
   splash: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: C.bg },
   splashMark: { width: 118, height: 118, borderRadius: 28, backgroundColor: '#FFF', alignItems: 'center', justifyContent: 'center', shadowColor: '#000', shadowOpacity: 0.08, shadowRadius: 22, shadowOffset: { width: 0, height: 12 }, elevation: 8 },
   zTile: { width: 54, height: 54, borderRadius: 14, backgroundColor: C.orangeSoft, alignItems: 'center', justifyContent: 'center' },
@@ -1284,15 +1686,16 @@ const s = StyleSheet.create({
   iconButton: { width: 39, height: 39, borderRadius: 12, backgroundColor: C.beige, alignItems: 'center', justifyContent: 'center' },
   iconText: { color: C.muted, fontSize: 22, fontWeight: '900' },
   body: { paddingHorizontal: 18, paddingBottom: 110, gap: 14 },
-  dashboardCard: { backgroundColor: '#FFF', borderRadius: 18, borderWidth: 1, borderColor: C.line, padding: 18, gap: 16 },
+  dashboardCard: { backgroundColor: '#FFF', borderRadius: 18, borderWidth: 1, borderColor: C.line, padding: 18, gap: 16, shadowColor: '#000', shadowOpacity: 0.05, shadowRadius: 18, shadowOffset: { width: 0, height: 10 }, elevation: 2 },
   card: { backgroundColor: '#FFF', borderRadius: 16, borderWidth: 1, borderColor: C.line, padding: 16, gap: 10 },
   rowBetween: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: 12 },
   bigTitle: { color: C.ink, fontWeight: '900', fontSize: 20 },
   muted: { color: C.muted, fontSize: 13, lineHeight: 19 },
-  kpiGrid: { flexDirection: 'row', flexWrap: 'wrap', rowGap: 14 },
-  kpi: { width: '50%' },
+  kpiGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 12 },
+  kpi: { width: '47.9%', aspectRatio: 1, borderRadius: 16, padding: 14, justifyContent: 'space-between', borderWidth: 1, borderColor: 'rgba(32,33,30,0.05)', shadowColor: '#000', shadowOpacity: 0.04, shadowRadius: 12, shadowOffset: { width: 0, height: 8 }, elevation: 1 },
   kpiLabel: { color: C.muted, fontSize: 12, fontWeight: '800' },
-  kpiValue: { color: C.ink, fontSize: 20, fontWeight: '900', marginTop: 4 },
+  kpiValue: { color: C.ink, fontSize: 26, fontWeight: '900', marginTop: 4 },
+  kpiArrow: { position: 'absolute', right: 12, bottom: 8, fontSize: 28, fontWeight: '900' },
   infoCard: { borderRadius: 16, padding: 16 },
   infoTitle: { fontWeight: '900', fontSize: 15 },
   infoText: { marginTop: 6, fontSize: 13 },
@@ -1372,4 +1775,9 @@ const s = StyleSheet.create({
   badge: { position: 'absolute', right: -14, top: -8, minWidth: 20, height: 20, borderRadius: 10, backgroundColor: '#A34641', color: '#FFF', fontWeight: '900', textAlign: 'center', overflow: 'hidden', fontSize: 11, lineHeight: 20 },
   modalShade: { flex: 1, backgroundColor: 'rgba(0,0,0,0.36)', justifyContent: 'center', padding: 22 },
   modalCard: { backgroundColor: C.bg, borderRadius: 22, padding: 20, gap: 12 },
+  newOrderModal: { backgroundColor: C.bg, borderRadius: 24, padding: 22, gap: 12, alignItems: 'center' },
+  newOrderTitle: { color: C.orange, fontSize: 18, fontWeight: '900', marginTop: 4 },
+  newOrderNo: { color: C.ink, fontSize: 24, fontWeight: '900' },
+  newOrderBody: { color: C.ink, fontSize: 16, fontWeight: '800' },
+  newOrderHint: { color: C.muted, fontSize: 12, textAlign: 'center', lineHeight: 18, marginBottom: 4 },
 });

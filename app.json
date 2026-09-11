@@ -26,6 +26,7 @@
         "ACCESS_NETWORK_STATE",
         "VIBRATE",
         "POST_NOTIFICATIONS",
+        "RECEIVE_BOOT_COMPLETED",
         "BLUETOOTH",
         "BLUETOOTH_ADMIN",
         "BLUETOOTH_CONNECT"
@@ -33,7 +34,10 @@
     },
     "extra": {
       "phpApiBase": "https://api.zepmed.org/api/v1",
-      "authApiBase": "https://auth.zepmed.org/api/v1"
+      "authApiBase": "https://auth.zepmed.org/api/v1",
+      "eas": {
+        "projectId": "0aaa9673-2c43-4af7-a140-5c6d6747cbb5"
+      }
     }
   }
 }
