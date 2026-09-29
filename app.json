@@ -7,6 +7,17 @@
     "icon": "./assets/ic_launcher.png",
     "userInterfaceStyle": "light",
     "scheme": "zepmedseller",
+    "splash": {
+      "image": "./assets/zepmed_logo.jpg",
+      "resizeMode": "contain",
+      "backgroundColor": "#FAF9F5"
+    },
+    "notification": {
+      "icon": "./assets/ic_launcher.png",
+      "color": "#E2632E",
+      "androidMode": "default",
+      "iosDisplayInForeground": true
+    },
     "assetBundlePatterns": [
       "**/*"
     ],
@@ -19,7 +30,7 @@
       "versionCode": 1,
       "adaptiveIcon": {
         "foregroundImage": "./assets/ic_launcher.png",
-        "backgroundColor": "#FAF9F5"
+        "backgroundColor": "#0F766E"
       },
       "permissions": [
         "INTERNET",
