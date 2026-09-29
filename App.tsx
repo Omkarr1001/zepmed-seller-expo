@@ -33,7 +33,6 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
-  Vibration,
   View,
 } from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -409,14 +408,23 @@ function statusTone(status?: string | null) {
     case 'placed':
     case 'new':
     case 'pending':
-      return { bg: C.yellowSoft, fg: C.yellow, label: 'New' };
+      return { bg: C.yellowSoft, fg: C.yellow, label: 'Pending' };
     case 'prescription_review':
       return { bg: C.purpleSoft, fg: C.purple, label: 'Prescription' };
     case 'confirmed':
+      return { bg: C.blueSoft, fg: C.blue, label: 'Confirmed' };
     case 'preparing':
-      return { bg: C.blueSoft, fg: C.blue, label: (status ?? '').replace(/_/g, ' ') };
+      return { bg: C.blueSoft, fg: C.blue, label: 'Preparing' };
+    case 'partial_forward':
+      return { bg: C.blueSoft, fg: C.blue, label: 'Partial forward' };
     case 'ready_for_pickup':
-      return { bg: C.greenSoft, fg: C.green, label: 'Ready' };
+      return { bg: C.greenSoft, fg: C.green, label: 'Ready to Pick Up' };
+    case 'assigned':
+      return { bg: C.greenSoft, fg: C.green, label: 'Assigned' };
+    case 'picked_up':
+      return { bg: C.blueSoft, fg: C.blue, label: 'Picked up' };
+    case 'out_for_delivery':
+      return { bg: C.blueSoft, fg: C.blue, label: 'Out for delivery' };
     case 'delivered':
     case 'completed':
       return { bg: C.greenSoft, fg: C.green, label: 'Delivered' };
@@ -460,9 +468,16 @@ function forgetSettledSilenced(orders: Order[]) {
 
 function quickActions(status: string) {
   const s = status.toLowerCase();
-  if (s === 'confirmed') return [{ code: 'preparing', label: 'Preparing' }, { code: 'ready_for_pickup', label: 'Ready' }];
-  if (s === 'preparing') return [{ code: 'ready_for_pickup', label: 'Ready' }];
+  if (s === 'confirmed' || s === 'partial_forward') {
+    return [{ code: 'preparing', label: 'Preparing' }, { code: 'ready_for_pickup', label: 'Ready for Pickup' }];
+  }
+  if (s === 'preparing') return [{ code: 'ready_for_pickup', label: 'Ready for Pickup' }];
   return [];
+}
+
+/** Live panel marks ready via POST seller/orders/action (triggers delivery offer). */
+function readyActionMessage(action: string) {
+  return `Status updated — ${action.replace(/_/g, ' ')}`;
 }
 
 function orderCardActions(order: Order) {
@@ -873,7 +888,7 @@ const sellerApi = {
   orderInvoice: (orderId: number) => request<OrderDetail>('seller/orders/invoice', { query: { order_id: orderId } }),
   processOrder: (body: unknown) => request<Record<string, unknown>>('seller/orders/process', { body }),
   prescriptionFill: (body: unknown) => request<OrderDetail>('seller/orders/prescription-fill', { body }),
-  orderAction: (orderId: number, action: string) => request<Record<string, unknown>>('seller/orders/action', { body: { order_id: orderId, action } }),
+  orderAction: (orderId: number, action: string, message?: string) => request<Record<string, unknown>>('seller/orders/action', { body: { order_id: orderId, action, ...(message ? { message } : {}) } }),
   inventory: (search = '') => request<{ items?: InventoryItem[] | null }>('seller/inventory', { query: { search, page: 1, limit: 100, status: 'all' } }),
   updateStock: (body: unknown) => request<Record<string, unknown>>('seller/inventory/update', { body }),
   catalogSearch: (search: string) => request<{ items?: CatalogSuggestion[] | null }>('seller/catalog/search', { query: { search, limit: 30 } }),
@@ -1191,8 +1206,8 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
       const firstFresh = next.find((order) => !knownOrders.current.has(order.id) && orderCanShowNewPopup(order));
       if (knownOrders.current.size && firstFresh) {
         setFresh(firstFresh);
-        Vibration.vibrate([0, 300, 120, 300]);
-        goTab('orders', 'pending');
+        // Ring immediately while seller may be on Home/Catalog/More — do not wait for Orders tab.
+        void startOrderBell(true);
       }
       knownOrders.current = new Set(next.map((order) => order.id));
       setOrders(next);
@@ -1217,6 +1232,10 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
       }
     }
   }, [goTab, inventory.length, refreshNotifUnread, tab]);
+
+  useEffect(() => {
+    prepareOrderBell().catch(() => undefined);
+  }, []);
 
   useEffect(() => {
     refresh(true);
@@ -1297,14 +1316,23 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
 
   async function action(orderId: number, code: string) {
     try {
-      await sellerApi.orderAction(orderId, code);
+      const message = ['confirmed', 'preparing', 'ready_for_pickup', 'rejected', 'cancelled'].includes(code)
+        ? readyActionMessage(code)
+        : undefined;
+      const res = await sellerApi.orderAction(orderId, code, message);
       await cancelOrderNotification(orderId);
       setFresh((current) => current?.id === orderId ? null : current);
+      const nextStatus = code === 'rx_accept'
+        ? 'confirmed'
+        : (typeof res.data?.status === 'string' ? String(res.data.status) : code);
       setOrders((current) => current.map((order) => (
         order.id === orderId
-          ? { ...order, status: code === 'rx_accept' ? 'confirmed' : code, seller_confirmed_at: new Date().toISOString() }
+          ? { ...order, status: nextStatus, seller_confirmed_at: order.seller_confirmed_at || new Date().toISOString() }
           : order
       )));
+      if (code === 'ready_for_pickup' && res.data?.auto_assigned) {
+        Alert.alert('Ready', 'Delivery partner auto-assigned');
+      }
       await refresh(true, true);
     } catch (err) {
       Alert.alert('Action failed', errorMessage(err));
@@ -1348,7 +1376,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
         />
       </View>
       <ScrollView refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => refresh()} tintColor={C.teal} />} contentContainerStyle={s.body}>
-        {fresh && tab === 'orders' ? <FreshBanner order={fresh} onClose={() => setFresh(null)} onOpen={() => openOrder(fresh.id)} /> : null}
+        {fresh ? <FreshBanner order={fresh} onClose={() => setFresh(null)} onOpen={() => openOrder(fresh.id)} /> : null}
         {error ? <Notice tone="error" title={error} /> : null}
         {tab === 'home' ? <HomeScreen dash={dash} orders={orders} onOpenOrder={openOrder} onAction={action} onDashboardTarget={openDashboardTarget} onStoreToggle={toggleStoreOpen} /> : null}
         {tab === 'orders' ? <OrdersScreen orders={orders} filter={orderFilter} onFilter={setOrderFilter} onOpenOrder={openOrder} onAction={action} /> : null}
@@ -1400,6 +1428,11 @@ function HomeScreen({
 }) {
   if (!dash) return <CenteredLoader />;
   const open = dash.is_open !== false && dash.is_open !== 0;
+  // Pending = not yet accepted only (placed/new/prescription_review). Do NOT use pending_dispatch
+  // which also counts confirmed/preparing/ready_for_pickup ("Pending Dispatch" on web panel).
+  const pendingCount = orders.filter((o) => pendingStatus(o.status)).length;
+  const preparingCount = orders.filter((o) => ['confirmed', 'preparing', 'partial_forward'].includes((o.status || '').toLowerCase())).length;
+  const readyCount = orders.filter((o) => (o.status || '').toLowerCase() === 'ready_for_pickup').length;
   return (
     <>
       <View style={s.dashboardCard}>
@@ -1420,8 +1453,16 @@ function HomeScreen({
         <View style={s.summaryGrid}>
           <SummaryTile label="Total Orders" value={String(dash.orders_total ?? 0)} onPress={() => onDashboardTarget('orders')} />
           <SummaryTile label="Revenue" value={shortMoney(dash.revenue_total)} onPress={() => onDashboardTarget('revenue')} />
-          <SummaryTile label="Pending" value={String(dash.pending_dispatch ?? 0)} onPress={() => onDashboardTarget('pending')} />
+          <SummaryTile label="Pending" value={String(pendingCount)} onPress={() => onDashboardTarget('pending')} />
           <SummaryTile label="Delivered" value={String(dash.delivered_count ?? 0)} onPress={() => onDashboardTarget('delivered')} />
+        </View>
+        <View style={[s.statRow, { marginTop: 10 }]}>
+          <StatCard label="Awaiting accept" value={String(pendingCount)} warm />
+          <StatCard label="Preparing" value={String(preparingCount)} />
+        </View>
+        <View style={[s.statRow, { marginTop: 8 }]}>
+          <StatCard label="Ready to pick up" value={String(readyCount)} />
+          <StatCard label="In pipeline" value={String(dash.pending_dispatch ?? pendingCount + preparingCount + readyCount)} />
         </View>
       </View>
       <View style={[s.infoCard, { backgroundColor: C.blueSoft }]}>
@@ -2409,13 +2450,21 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
   async function run(code: string) {
     setActing(true);
     try {
-      await sellerApi.orderAction(detail.id, code);
+      const message = ['confirmed', 'preparing', 'ready_for_pickup', 'rejected', 'cancelled', 'wrong_prescription'].includes(code)
+        ? readyActionMessage(code)
+        : undefined;
+      const res = await sellerApi.orderAction(detail.id, code, message);
       await cancelOrderNotification(detail.id);
-      setDetail((current) => current ? { ...current, status: code === 'rx_accept' ? 'confirmed' : code, seller_confirmed_at: new Date().toISOString() } : current);
+      const nextStatus = code === 'rx_accept'
+        ? 'confirmed'
+        : (typeof res.data?.status === 'string' ? String(res.data.status) : code);
+      setDetail((current) => current ? { ...current, status: nextStatus, seller_confirmed_at: current.seller_confirmed_at || new Date().toISOString() } : current);
       await reload();
       if (code === 'ready_for_pickup') {
         const prefs = await readPrefs();
         if (prefs.autoPrint) await printCurrentBill().catch(() => undefined);
+        if (res.data?.auto_assigned) Alert.alert('Ready', 'Delivery partner auto-assigned');
+        else Alert.alert('Ready', 'Marked ready for pickup — delivery partners notified');
         onBack();
       }
     } catch (err) {
@@ -2425,28 +2474,44 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
     }
   }
 
+  function processPayload(finalStatus: string) {
+    return {
+      order_id: detail.id,
+      seller_notes: notes,
+      final_status: finalStatus,
+      items: (detail.items ?? []).map((item) => ({
+        order_item_id: item.id,
+        fulfill_qty: Number(fulfill[item.id] || 0),
+        forward_qty: Number(forward[item.id]?.qty || 0),
+        forward_to_pharmacy_id: Number(forward[item.id]?.pharmacyId || 0),
+      })),
+    };
+  }
+
   async function process(finalStatus: string) {
     setActing(true);
     try {
-      await sellerApi.processOrder({
-        order_id: detail.id,
-        seller_notes: notes,
-        final_status: finalStatus,
-        items: (detail.items ?? []).map((item) => ({
-          order_item_id: item.id,
-          fulfill_qty: Number(fulfill[item.id] || 0),
-          forward_qty: Number(forward[item.id]?.qty || 0),
-          forward_to_pharmacy_id: Number(forward[item.id]?.pharmacyId || 0),
-        })),
-      });
+      // Panel never jumps placed → ready via process for dispatch; accept first, then action ready.
+      // Keep process for confirmed/preparing/rejected only.
+      if (finalStatus === 'ready_for_pickup') {
+        await sellerApi.processOrder(processPayload('confirmed'));
+        await cancelOrderNotification(detail.id);
+        const res = await sellerApi.orderAction(detail.id, 'ready_for_pickup', readyActionMessage('ready_for_pickup'));
+        const nextStatus = typeof res.data?.status === 'string' ? String(res.data.status) : 'ready_for_pickup';
+        setDetail((current) => current ? { ...current, status: nextStatus, seller_confirmed_at: current.seller_confirmed_at || new Date().toISOString() } : current);
+        await reload();
+        const prefs = await readPrefs();
+        if (prefs.autoPrint) await printCurrentBill().catch(() => undefined);
+        if (res.data?.auto_assigned) Alert.alert('Ready', 'Delivery partner auto-assigned');
+        else Alert.alert('Ready', 'Marked ready for pickup — delivery partners notified');
+        onBack();
+        return;
+      }
+      await sellerApi.processOrder(processPayload(finalStatus));
       await cancelOrderNotification(detail.id);
       setDetail((current) => current ? { ...current, status: finalStatus, seller_confirmed_at: current.seller_confirmed_at || new Date().toISOString() } : current);
       await reload();
-      if (finalStatus === 'ready_for_pickup') {
-        const prefs = await readPrefs();
-        if (prefs.autoPrint) await printCurrentBill().catch(() => undefined);
-      }
-      if (finalStatus === 'ready_for_pickup' || finalStatus === 'rejected') onBack();
+      if (finalStatus === 'rejected') onBack();
     } catch (err) {
       Alert.alert('Order', errorMessage(err));
     } finally {
@@ -2621,7 +2686,7 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
         {pending && !rx ? (
           <>
             <Primary label="Confirm & Save" disabled={acting} onPress={() => process('confirmed')} />
-            <Primary label="Confirm & Ready for Pickup" disabled={acting} onPress={() => process('ready_for_pickup')} />
+            <Primary label="Accept & Ready for Pickup" disabled={acting} onPress={() => process('ready_for_pickup')} />
             <Secondary label="Confirm & Start Preparing" disabled={acting} onPress={() => process('preparing')} />
             <Danger label="Reject order" disabled={acting} onPress={() => process('rejected')} />
           </>
@@ -3285,8 +3350,15 @@ function IconButton({ label, onPress }: { label: string; onPress: () => void }) 
 }
 
 function OrderStepper({ status }: { status: string }) {
-  const steps = ['New', 'Confirmed', 'Preparing', 'Ready'];
-  const normalized = status === 'ready_for_pickup' ? 'Ready' : status === 'preparing' ? 'Preparing' : status === 'confirmed' ? 'Confirmed' : 'New';
+  const steps = ['Pending', 'Confirmed', 'Preparing', 'Ready'];
+  const st = (status || '').toLowerCase();
+  const normalized = ['ready_for_pickup', 'assigned', 'picked_up', 'out_for_delivery', 'delivered', 'completed'].includes(st)
+    ? 'Ready'
+    : st === 'preparing' || st === 'partial_forward'
+      ? 'Preparing'
+      : st === 'confirmed'
+        ? 'Confirmed'
+        : 'Pending';
   const current = Math.max(0, steps.indexOf(normalized));
   return <View style={s.stepper}>{steps.map((step, idx) => <View key={step} style={s.step}><Text style={[s.stepDot, idx <= current && { color: C.orange }]}>●</Text><Text style={s.stepText}>{step}</Text></View>)}</View>;
 }

@@ -15,16 +15,25 @@ export async function prepareOrderBell() {
   });
 }
 
+/**
+ * Start looping bell + vibration for a new order.
+ * Safe to call from SellerShell poll while seller is on any tab.
+ */
 export async function startOrderBell(vibrate = true) {
   if (AppState.currentState !== 'active') return;
-  if (ringing) return;
+  if (ringing) {
+    // Already alerting — keep existing loop; ensure vibrate still runs.
+    if (vibrate) Vibration.vibrate([0, 400, 150, 400, 150, 500], true);
+    return;
+  }
   const mine = generation + 1;
   generation = mine;
   ringing = true;
   try {
+    // Vibrate immediately so seller feels the alert before audio finishes loading.
+    if (vibrate) Vibration.vibrate([0, 400, 150, 400, 150, 500], true);
     await prepareOrderBell();
     if (generation !== mine) return;
-    if (vibrate) Vibration.vibrate([0, 400, 150, 400, 150, 500], true);
     const created = await Audio.Sound.createAsync(require('./assets/bell.mp3'), {
       shouldPlay: true,
       isLooping: true,
