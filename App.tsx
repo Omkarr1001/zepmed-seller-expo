@@ -93,7 +93,8 @@ Notifications.setNotificationHandler({
   handleNotification: async () => ({
     shouldShowAlert: true,
     shouldPlaySound: true,
-    shouldSetBadge: true,
+    // App icon badge = seller inbox unread only (not pending order count).
+    shouldSetBadge: false,
     shouldShowBanner: true,
     shouldShowList: true,
     priority: Notifications.AndroidNotificationPriority.MAX,
@@ -276,7 +277,21 @@ type SellerSettings = {
   auto_active_now?: boolean | number;
   pharmacy?: PharmacyInfo | null;
 };
-type SellerNotification = { id: number; title?: string | null; message?: string | null; body?: string | null; is_read?: number | boolean | null; created_at?: string | null; category?: string | null; type?: string | null };
+type SellerNotification = {
+  id: number;
+  title?: string | null;
+  message?: string | null;
+  body?: string | null;
+  is_read?: number | boolean | string | null;
+  read_at?: string | null;
+  created_at?: string | null;
+  category?: string | null;
+  type?: string | null;
+  action?: string | null;
+  product_id?: number | null;
+  meta?: { action?: string | null; status?: string | null; approval_status?: string | null; product_id?: number | null; [key: string]: unknown } | null;
+};
+type NotifFilter = 'all' | 'approved' | 'rejected';
 type RxRequest = { id: number; customer_name?: string | null; customer_phone?: string | null; status?: string | null; prescription_url?: string | null; created_at?: string | null; notes?: string | null; request_number?: string | null; message?: string | null };
 type DiscountRule = {
   id: number;
@@ -698,6 +713,43 @@ async function schedulePendingOrderNotification(order: Order, existing: Record<s
   return { ...existing, [key]: `${ids.now}|${ids.remind}` };
 }
 
+async function syncInboxBadgeCount(explicitCount?: number) {
+  try {
+    let count = explicitCount;
+    if (count === undefined) {
+      const res = await sellerApi.notificationUnreadCount();
+      count = Number(res.data?.unread_count ?? 0);
+    }
+    const n = Math.max(0, Number(count) || 0);
+    await Notifications.setBadgeCountAsync(n).catch(() => undefined);
+    return n;
+  } catch {
+    return 0;
+  }
+}
+
+function notificationIsRead(n: SellerNotification) {
+  if (n.read_at) return true;
+  return n.is_read === true || n.is_read === 1 || n.is_read === '1';
+}
+
+/** Mirror seller-panel notificationDecisionStatus — approved vs rejected product alerts. */
+function notificationDecisionStatus(n: SellerNotification): 'approved' | 'rejected' | 'expired' | '' {
+  const action = String(n.action || n.meta?.action || n.meta?.status || n.meta?.approval_status || '').toLowerCase();
+  if (action === 'approved' || action === 'approve') return 'approved';
+  if (action === 'rejected' || action === 'reject') return 'rejected';
+  const blob = `${n.type || ''} ${n.title || ''} ${n.message || ''} ${n.body || ''}`.toLowerCase();
+  if (/\breject(ed|ion)?\b/.test(blob)) return 'rejected';
+  if (/\bapprov(ed|al|e)\b/.test(blob)) return 'approved';
+  if (String(n.type || '').toLowerCase() === 'subscription' || /\bexpir/.test(blob)) return 'expired';
+  return '';
+}
+
+function notificationMatchesFilter(n: SellerNotification, filter: NotifFilter) {
+  if (filter === 'all') return true;
+  return notificationDecisionStatus(n) === filter;
+}
+
 async function syncPendingOrderNotifications(orders: Order[], opts?: { forcePresent?: boolean }) {
   forgetSettledSilenced(orders);
   const prefs = await readPrefs();
@@ -711,7 +763,8 @@ async function syncPendingOrderNotifications(orders: Order[], opts?: { forcePres
     await stopOrderBell();
     await Promise.all(Object.values(next).map((id) => cancelStoredNotificationIds(id)));
     await writeNotificationMap({});
-    await Notifications.setBadgeCountAsync(0).catch(() => undefined);
+    // Do not clear app badge here — badge tracks inbox unread, not orders.
+    await syncInboxBadgeCount().catch(() => undefined);
     return;
   }
 
@@ -734,7 +787,8 @@ async function syncPendingOrderNotifications(orders: Order[], opts?: { forcePres
   }
 
   await writeNotificationMap(next);
-  await Notifications.setBadgeCountAsync(pendingIds.size).catch(() => undefined);
+  // Orders tab keeps pending order count; app/notif badge stays inbox unread only.
+  await syncInboxBadgeCount().catch(() => undefined);
 }
 
 async function cancelOrderNotification(orderId: number) {
@@ -833,10 +887,10 @@ const sellerApi = {
   savePharmacyInfo: (body: unknown) => request<PharmacyInfoPayload>('seller/pharmacy-info', { body }),
   settings: () => request<SellerSettings>('seller/settings'),
   saveSettings: (body: unknown) => request<SellerSettings>('seller/settings', { body }),
-  notifications: (unread = false) => request<{ items?: SellerNotification[] | null; pagination?: unknown }>('seller/notifications', { query: { page: 1, limit: 50, unread: unread ? 1 : undefined } }),
+  notifications: (unread = false) => request<{ items?: SellerNotification[] | null; unread_count?: number | null; pagination?: unknown }>('seller/notifications', { query: { page: 1, limit: 50, unread: unread ? 1 : undefined } }),
   notificationUnreadCount: () => request<{ unread_count?: number | null }>('seller/notifications/unread-count'),
-  markNotificationRead: (id: number) => request<Record<string, unknown>>(`seller/notifications/${id}/read`, { body: {} }),
-  markAllNotificationsRead: () => request<Record<string, unknown>>('seller/notifications/read-all', { body: {} }),
+  markNotificationRead: (id: number) => request<{ id?: number; unread_count?: number | null }>('seller/notifications/' + id + '/read', { body: {} }),
+  markAllNotificationsRead: () => request<{ updated?: number; unread_count?: number | null }>('seller/notifications/read-all', { body: {} }),
   rxRequests: () => request<{ items?: RxRequest[] | null }>('seller/rx-requests', { query: { status: 'open' } }),
   rxRequestDetail: (requestId: number) => request<RxRequest>('seller/rx-requests/detail', { query: { request_id: requestId } }),
   rxRequestFillToCart: (body: unknown) => request<Record<string, unknown>>('seller/rx-requests/fill-to-cart', { body }),
@@ -1086,10 +1140,20 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
   const [showReport, setShowReport] = useState(false);
   const [moreModule, setMoreModule] = useState<MoreModule>(null);
   const [fresh, setFresh] = useState<Order | null>(null);
+  const [notifUnread, setNotifUnread] = useState(0);
   const knownOrders = useRef<Set<number>>(new Set());
   const refreshInFlight = useRef(false);
   const refreshQueued = useRef(false);
   const tabHistory = useRef<TabKey[]>([]);
+
+  const refreshNotifUnread = useCallback(async () => {
+    try {
+      const n = await syncInboxBadgeCount();
+      setNotifUnread(n);
+    } catch {
+      setNotifUnread(0);
+    }
+  }, []);
 
   const goTab = useCallback((next: TabKey, filter?: OrderFilter) => {
     if (filter) setOrderFilter(filter);
@@ -1133,6 +1197,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
       knownOrders.current = new Set(next.map((order) => order.id));
       setOrders(next);
       await syncPendingOrderNotifications(next);
+      await refreshNotifUnread();
 
       try {
         const inv = await sellerApi.inventory();
@@ -1151,7 +1216,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
         refresh(true, true);
       }
     }
-  }, [goTab, inventory.length, tab]);
+  }, [goTab, inventory.length, refreshNotifUnread, tab]);
 
   useEffect(() => {
     refresh(true);
@@ -1269,7 +1334,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
 
   if (selectedOrder) return <OrderDetailScreen order={selectedOrder} dash={dash} onBack={() => { setSelectedOrder(null); refresh(true); }} />;
   if (showReport) return <ReportsScreen onBack={() => setShowReport(false)} />;
-  if (moreModule) return <MoreModuleScreen module={moreModule} dash={dash} onBack={() => { setMoreModule(null); refresh(true); }} onRefresh={() => refresh(true)} />;
+  if (moreModule) return <MoreModuleScreen module={moreModule} dash={dash} onBack={() => { setMoreModule(null); refresh(true); }} onRefresh={() => refresh(true)} onUnreadChange={(n) => { setNotifUnread(n); syncInboxBadgeCount(n).catch(() => undefined); }} />;
 
   return (
     <View style={s.screen}>
@@ -1278,6 +1343,8 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
           title={tab === 'home' ? 'ZepMed Seller' : tab === 'stock' ? 'Stock Management' : tab[0].toUpperCase() + tab.slice(1)}
           subtitle={[dash?.pharmacy?.name, dash?.pharmacy?.city].filter(Boolean).join(' • ') || 'Pharmacy'}
           onRefresh={() => refresh()}
+          notifUnread={notifUnread}
+          onOpenNotifications={() => setMoreModule('notifications')}
         />
       </View>
       <ScrollView refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => refresh()} tintColor={C.teal} />} contentContainerStyle={s.body}>
@@ -1287,7 +1354,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
         {tab === 'orders' ? <OrdersScreen orders={orders} filter={orderFilter} onFilter={setOrderFilter} onOpenOrder={openOrder} onAction={action} /> : null}
         {tab === 'catalog' ? <CatalogScreen items={inventory} onEdit={setEditItem} onStock={() => goTab('stock')} onAddProducts={() => setMoreModule('products')} /> : null}
         {tab === 'stock' ? <StockManagementScreen /> : null}
-        {tab === 'more' ? <MoreScreen dash={dash} onReport={() => setShowReport(true)} onOpenModule={setMoreModule} onRefresh={() => refresh()} onLogout={onLogout} /> : null}
+        {tab === 'more' ? <MoreScreen dash={dash} notifUnread={notifUnread} onReport={() => setShowReport(true)} onOpenModule={setMoreModule} onRefresh={() => refresh()} onLogout={onLogout} /> : null}
       </ScrollView>
       <BottomTabs current={tab} setTab={goTab} pending={orders.filter((o) => pendingStatus(o.status)).length} />
       <StockEditModal item={editItem} onClose={() => setEditItem(null)} onSaved={() => { setEditItem(null); refresh(true); }} />
@@ -1296,7 +1363,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
   );
 }
 
-function Header({ title, subtitle, onRefresh, onLogout }: { title: string; subtitle: string; onRefresh: () => void; onLogout?: () => void }) {
+function Header({ title, subtitle, onRefresh, onLogout, notifUnread = 0, onOpenNotifications }: { title: string; subtitle: string; onRefresh: () => void; onLogout?: () => void; notifUnread?: number; onOpenNotifications?: () => void }) {
   return (
     <View style={s.header}>
       <Image source={APP_ICON} style={s.headerLogo} resizeMode="cover" />
@@ -1304,6 +1371,12 @@ function Header({ title, subtitle, onRefresh, onLogout }: { title: string; subti
         <Text style={s.headerTitle} numberOfLines={1}>{title}</Text>
         <Text style={s.headerSub} numberOfLines={1}>{subtitle}</Text>
       </View>
+      {onOpenNotifications ? (
+        <TouchableOpacity style={s.iconButton} onPress={onOpenNotifications} accessibilityLabel="Notifications">
+          <Text style={s.iconText}>🔔</Text>
+          {notifUnread > 0 ? <Text style={s.headerNotifBadge}>{notifUnread > 99 ? '99+' : String(notifUnread)}</Text> : null}
+        </TouchableOpacity>
+      ) : null}
       <IconButton label="↻" onPress={onRefresh} />
       {onLogout ? <IconButton label="‹" onPress={onLogout} /> : null}
     </View>
@@ -1455,11 +1528,7 @@ function CatalogScreen({ items, onEdit, onStock, onAddProducts }: { items: Inven
   );
 }
 
-function MoreScreen({ dash, onReport, onOpenModule, onRefresh, onLogout }: { dash: DashboardData | null; onReport: () => void; onOpenModule: (module: MoreModule) => void; onRefresh: () => void; onLogout: () => void }) {
-  const [unread, setUnread] = useState(0);
-  useEffect(() => {
-    sellerApi.notificationUnreadCount().then((r) => setUnread(Number(r.data?.unread_count ?? 0))).catch(() => setUnread(0));
-  }, []);
+function MoreScreen({ dash, notifUnread = 0, onReport, onOpenModule, onRefresh, onLogout }: { dash: DashboardData | null; notifUnread?: number; onReport: () => void; onOpenModule: (module: MoreModule) => void; onRefresh: () => void; onLogout: () => void }) {
   return (
     <>
       <SectionTitle title="Pharmacy profile" />
@@ -1474,7 +1543,7 @@ function MoreScreen({ dash, onReport, onOpenModule, onRefresh, onLogout }: { das
           ['pharmacy', '🏥', 'Pharmacy', 'DL · GST · bill header'],
           ['settings', '⚙️', 'Settings', 'Hours · delivery · alerts'],
           ['printer', '🖨️', 'Printer', 'Thermal 58 · half A4'],
-          ['notifications', '🔔', 'Alerts', unread ? `${unread} unread` : 'Inbox'],
+          ['notifications', '🔔', 'Alerts', notifUnread ? `${notifUnread} unread` : 'Inbox'],
           ['rx', '💊', 'Rx desk', 'Fill cart · message'],
           ['stock', '📦', 'Stock', 'Add · history · sold'],
           ['virtual', '🛍️', 'Virtual shop', 'Listing · discounts'],
@@ -1488,6 +1557,7 @@ function MoreScreen({ dash, onReport, onOpenModule, onRefresh, onLogout }: { das
             <Text style={s.moreTileIcon}>{icon}</Text>
             <Text style={s.moreTileTitle}>{title}</Text>
             <Text style={s.moreTileBody}>{body}</Text>
+            {key === 'notifications' && notifUnread > 0 ? <Text style={s.moreTileBadge}>{notifUnread > 99 ? '99+' : String(notifUnread)}</Text> : null}
           </TouchableOpacity>
         ))}
       </View>
@@ -1630,7 +1700,7 @@ function WholesaleScreen({ dash, canWholesale, onRefresh }: { dash: DashboardDat
   );
 }
 
-function MoreModuleScreen({ module, dash, onBack, onRefresh }: { module: MoreModule; dash: DashboardData | null; onBack: () => void; onRefresh: () => void }) {
+function MoreModuleScreen({ module, dash, onBack, onRefresh, onUnreadChange }: { module: MoreModule; dash: DashboardData | null; onBack: () => void; onRefresh: () => void; onUnreadChange?: (n: number) => void }) {
   const insets = useSafeAreaInsets();
   const title = module === 'pharmacy' ? 'Pharmacy Info'
     : module === 'settings' ? 'Store Settings'
@@ -1653,7 +1723,7 @@ function MoreModuleScreen({ module, dash, onBack, onRefresh }: { module: MoreMod
       <ScrollView contentContainerStyle={s.body}>
         {module === 'pharmacy' ? <PharmacyInfoScreen /> : null}
         {module === 'settings' ? <StoreSettingsScreen /> : null}
-        {module === 'notifications' ? <NotificationsScreen /> : null}
+        {module === 'notifications' ? <NotificationsScreen onUnreadChange={onUnreadChange} /> : null}
         {module === 'rx' ? <RxRequestsScreen /> : null}
         {module === 'stock' ? <StockManagementScreen /> : null}
         {module === 'virtual' ? <VirtualShopScreen /> : null}
@@ -1861,26 +1931,121 @@ function PrinterSettingsScreen({ dash }: { dash: DashboardData | null }) {
   );
 }
 
-function NotificationsScreen() {
+function NotificationsScreen({ onUnreadChange }: { onUnreadChange?: (n: number) => void }) {
   const [items, setItems] = useState<SellerNotification[]>([]);
   const [loading, setLoading] = useState(true);
-  const [unreadOnly, setUnreadOnly] = useState(false);
+  const [filter, setFilter] = useState<NotifFilter>('all');
   const [error, setError] = useState('');
+  const [acting, setActing] = useState(false);
+
+  const publishUnread = useCallback((n: number) => {
+    onUnreadChange?.(n);
+    syncInboxBadgeCount(n).catch(() => undefined);
+  }, [onUnreadChange]);
+
   const load = useCallback(async () => {
     setLoading(true); setError('');
-    try { const res = await sellerApi.notifications(unreadOnly); setItems(res.data?.items ?? []); }
-    catch (err) { setError(errorMessage(err)); }
-    finally { setLoading(false); }
-  }, [unreadOnly]);
+    try {
+      const res = await sellerApi.notifications(false);
+      const list = res.data?.items ?? [];
+      setItems(list);
+      const unreadFromApi = res.data?.unread_count;
+      const unread = unreadFromApi != null
+        ? Number(unreadFromApi)
+        : list.filter((n) => !notificationIsRead(n)).length;
+      publishUnread(unread);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setLoading(false);
+    }
+  }, [publishUnread]);
+
   useEffect(() => { load(); }, [load]);
-  async function markRead(id: number) { await sellerApi.markNotificationRead(id); load(); }
-  async function markAll() { await sellerApi.markAllNotificationsRead(); load(); }
+
+  const filtered = useMemo(() => items.filter((n) => notificationMatchesFilter(n, filter)), [items, filter]);
+  const unreadCount = items.filter((n) => !notificationIsRead(n)).length;
+  const approvedCount = items.filter((n) => notificationDecisionStatus(n) === 'approved').length;
+  const rejectedCount = items.filter((n) => notificationDecisionStatus(n) === 'rejected').length;
+
+  async function markRead(id: number) {
+    if (acting) return;
+    setActing(true);
+    try {
+      const res = await sellerApi.markNotificationRead(id);
+      setItems((prev) => prev.map((n) => (n.id === id ? { ...n, is_read: true, read_at: n.read_at || new Date().toISOString() } : n)));
+      if (res.data?.unread_count != null) publishUnread(Number(res.data.unread_count));
+      else publishUnread(Math.max(0, unreadCount - 1));
+    } catch (err) {
+      Alert.alert('Notifications', errorMessage(err));
+    } finally {
+      setActing(false);
+    }
+  }
+
+  async function markAll() {
+    if (acting) return;
+    setActing(true);
+    try {
+      const res = await sellerApi.markAllNotificationsRead();
+      setItems((prev) => prev.map((n) => ({ ...n, is_read: true, read_at: n.read_at || new Date().toISOString() })));
+      publishUnread(Number(res.data?.unread_count ?? 0));
+    } catch (err) {
+      Alert.alert('Notifications', errorMessage(err));
+    } finally {
+      setActing(false);
+    }
+  }
+
   return <>
-    <View style={s.rowBetween}><TouchableOpacity style={[s.smallChip, unreadOnly && { backgroundColor: C.ink }]} onPress={() => setUnreadOnly(!unreadOnly)}><Text style={[s.smallChipText, unreadOnly && { color: '#FFF' }]}>Unread only</Text></TouchableOpacity><Secondary label="Read all" compact onPress={markAll} /></View>
+    <Segment<NotifFilter>
+      value={filter}
+      options={[
+        ['all', `All (${items.length})`],
+        ['approved', `Approved (${approvedCount})`],
+        ['rejected', `Rejected (${rejectedCount})`],
+      ]}
+      onChange={setFilter}
+      dark
+    />
+    <View style={s.rowBetween}>
+      <Text style={s.count}>{unreadCount > 0 ? `${unreadCount} unread` : 'All caught up'} · {filtered.length} shown</Text>
+      {unreadCount > 0 ? <Secondary label="Read all" compact onPress={markAll} disabled={acting} /> : null}
+    </View>
     {loading ? <CenteredLoader compact /> : null}
     {error ? <Notice tone="error" title="Could not load notifications" body={error} /> : null}
-    {items.map((n) => <TouchableOpacity key={n.id} style={s.card} onPress={() => markRead(n.id)}><View style={s.rowBetween}><Text style={s.itemTitle}>{n.title || n.category || 'Notification'}</Text>{n.is_read ? <Pill text="Read" /> : <Pill text="Unread" tone="orange" />}</View><Text style={s.muted}>{n.message || n.body || '-'}</Text><Text style={s.footer}>{prettyDate(n.created_at)}</Text></TouchableOpacity>)}
-    {!loading && !items.length ? <Empty title="No notifications" body="Admin approvals and platform alerts will appear here." /> : null}
+    {filtered.map((n) => {
+      const unread = !notificationIsRead(n);
+      const decision = notificationDecisionStatus(n);
+      return (
+        <TouchableOpacity
+          key={n.id}
+          style={[s.card, unread ? s.notifCardUnread : s.notifCardRead]}
+          onPress={() => { if (unread) markRead(n.id); }}
+          activeOpacity={0.85}
+        >
+          <View style={s.rowBetween}>
+            <Text style={[s.itemTitle, { flex: 1 }]}>{n.title || n.category || n.type || 'Notification'}</Text>
+            {decision === 'approved' ? <Pill text="Approved" tone="green" /> : null}
+            {decision === 'rejected' ? <Pill text="Rejected" tone="red" /> : null}
+            {decision === 'expired' ? <Pill text="Expired" tone="orange" /> : null}
+            {!decision && unread ? <Pill text="Unread" tone="orange" /> : null}
+            {!decision && !unread ? <Pill text="Read" /> : null}
+          </View>
+          <Text style={s.muted}>{n.message || n.body || '-'}</Text>
+          <View style={s.rowBetween}>
+            <Text style={s.footer}>{prettyDate(n.created_at)}</Text>
+            {unread ? <Text style={s.notifMarkHint}>Tap to mark read</Text> : <Text style={s.notifMarkHint}>Read</Text>}
+          </View>
+        </TouchableOpacity>
+      );
+    })}
+    {!loading && !filtered.length ? (
+      <Empty
+        title={filter === 'approved' ? 'No approved product alerts' : filter === 'rejected' ? 'No rejected product alerts' : 'No notifications'}
+        body="Admin product approvals and platform alerts sync with the seller panel inbox."
+      />
+    ) : null}
   </>;
 }
 
@@ -3174,7 +3339,12 @@ const s = StyleSheet.create({
   headerLogo: { width: 44, height: 44, borderRadius: 14, backgroundColor: C.teal },
   headerTitle: { color: C.ink, fontWeight: '900', fontSize: 22 },
   headerSub: { color: C.muted, marginTop: 3, fontSize: 12 },
-  iconButton: { width: 40, height: 40, borderRadius: 14, backgroundColor: C.tealSoft, alignItems: 'center', justifyContent: 'center' },
+  iconButton: { width: 40, height: 40, borderRadius: 14, backgroundColor: C.tealSoft, alignItems: 'center', justifyContent: 'center', position: 'relative' },
+  headerNotifBadge: { position: 'absolute', right: -4, top: -4, minWidth: 18, height: 18, borderRadius: 9, backgroundColor: C.redAccent, color: '#FFF', fontWeight: '900', textAlign: 'center', overflow: 'hidden', fontSize: 10, lineHeight: 18, paddingHorizontal: 3 },
+  notifCardUnread: { backgroundColor: '#E5E7EB', borderColor: '#CBD5E1' },
+  notifCardRead: { backgroundColor: '#FFFFFF' },
+  notifMarkHint: { color: C.muted, fontSize: 11, fontWeight: '800' },
+  moreTileBadge: { position: 'absolute', right: 10, top: 10, minWidth: 18, height: 18, borderRadius: 9, backgroundColor: C.redAccent, color: '#FFF', fontWeight: '900', textAlign: 'center', overflow: 'hidden', fontSize: 10, lineHeight: 18, paddingHorizontal: 3 },
   iconText: { color: C.muted, fontSize: 22, fontWeight: '900' },
   body: { paddingHorizontal: 18, paddingBottom: 128, gap: 14 },
   dashboardCard: { backgroundColor: '#FFF', borderRadius: 22, borderWidth: 1, borderColor: C.line, padding: 18, gap: 16, shadowColor: C.teal, shadowOpacity: 0.08, shadowRadius: 18, shadowOffset: { width: 0, height: 10 }, elevation: 3 },
@@ -3292,7 +3462,7 @@ const s = StyleSheet.create({
   newOrderBody: { color: C.ink, fontSize: 16, fontWeight: '800' },
   newOrderHint: { color: C.muted, fontSize: 12, textAlign: 'center', lineHeight: 18, marginBottom: 4 },
   moreGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
-  moreTile: { width: '47.8%', minHeight: 108, borderRadius: 20, backgroundColor: '#FFF', borderWidth: 1, borderColor: C.line, padding: 14, justifyContent: 'flex-start', shadowColor: C.teal, shadowOpacity: 0.05, shadowRadius: 8, shadowOffset: { width: 0, height: 4 }, elevation: 1 },
+  moreTile: { width: '47.8%', minHeight: 108, borderRadius: 20, backgroundColor: '#FFF', borderWidth: 1, borderColor: C.line, padding: 14, justifyContent: 'flex-start', shadowColor: C.teal, shadowOpacity: 0.05, shadowRadius: 8, shadowOffset: { width: 0, height: 4 }, elevation: 1, position: 'relative' },
   moreTileIcon: { fontSize: 22, marginBottom: 8 },
   moreTileTitle: { color: C.ink, fontSize: 15, fontWeight: '900' },
   moreTileBody: { color: C.muted, fontSize: 12, lineHeight: 16, marginTop: 4 },
