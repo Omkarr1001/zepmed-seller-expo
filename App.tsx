@@ -20,6 +20,7 @@ import {
   BackHandler,
   Easing,
   Image,
+  KeyboardAvoidingView,
   Linking,
   Modal,
   PermissionsAndroid,
@@ -33,6 +34,7 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -80,6 +82,8 @@ const ORDER_POLL_TASK = 'zepmed-seller-order-poll';
 const ORDER_NOTIFICATION_CATEGORY = 'zepmed-seller-order-actions';
 const ORDER_CHANNEL = 'zepmed-order-bell-v4';
 const silencedOrderIds = new Set<number>();
+/** Prevent double Ready POSTs — each ready_for_pickup clears delivery_agent_id and re-offers. */
+const readyInFlight = new Set<number>();
 const TAB_LOGOS: Record<TabKey, number> = {
   home: require('./assets/tab-home.png'),
   orders: require('./assets/tab-orders.png'),
@@ -466,8 +470,21 @@ function forgetSettledSilenced(orders: Order[]) {
   }
 }
 
+function orderStatusKey(status?: string | null) {
+  return (status ?? '').toLowerCase().trim();
+}
+
+/** Live panel orderCanMarkReady — only confirmed/preparing may go Ready (once). */
+function orderCanMarkReady(status?: string | null) {
+  return ['confirmed', 'preparing', 'partial_forward'].includes(orderStatusKey(status));
+}
+
+function orderAlreadyReadyOrPast(status?: string | null) {
+  return ['ready_for_pickup', 'assigned', 'picked_up', 'out_for_delivery', 'delivered', 'completed'].includes(orderStatusKey(status));
+}
+
 function quickActions(status: string) {
-  const s = status.toLowerCase();
+  const s = orderStatusKey(status);
   if (s === 'confirmed' || s === 'partial_forward') {
     return [{ code: 'preparing', label: 'Preparing' }, { code: 'ready_for_pickup', label: 'Ready for Pickup' }];
   }
@@ -475,9 +492,33 @@ function quickActions(status: string) {
   return [];
 }
 
-/** Live panel marks ready via POST seller/orders/action (triggers delivery offer). */
+/** Live panel marks ready via POST seller/orders/action (triggers exclusive delivery offer). */
 function readyActionMessage(action: string) {
   return `Status updated — ${action.replace(/_/g, ' ')}`;
+}
+
+/**
+ * Single Ready call matching live seller panel updateOrderStatusOnly('ready_for_pickup').
+ * Never re-POST ready — server clears delivery_agent_id and re-offers on every ready_for_pickup.
+ */
+async function markOrderReadyOnce(orderId: number, currentStatus?: string | null) {
+  if (orderAlreadyReadyOrPast(currentStatus)) {
+    return { skipped: true as const, data: { order_id: orderId, status: orderStatusKey(currentStatus) || 'ready_for_pickup' } };
+  }
+  if (!orderCanMarkReady(currentStatus) && currentStatus) {
+    throw new Error(orderAlreadyReadyOrPast(currentStatus) ? 'Order is already ready' : 'Accept the order first, then mark Ready');
+  }
+  if (readyInFlight.has(orderId)) {
+    throw new Error('Ready already in progress — wait a moment');
+  }
+  readyInFlight.add(orderId);
+  try {
+    const res = await sellerApi.orderAction(orderId, 'ready_for_pickup', readyActionMessage('ready_for_pickup'));
+    return { skipped: false as const, data: res.data ?? { order_id: orderId, status: 'ready_for_pickup' }, auto_assigned: res.data?.auto_assigned };
+  } finally {
+    // Keep lock briefly so double-taps / remounts cannot re-fire before status refresh.
+    setTimeout(() => readyInFlight.delete(orderId), 4000);
+  }
 }
 
 function orderCardActions(order: Order) {
@@ -486,6 +527,15 @@ function orderCardActions(order: Order) {
     return [{ code: 'confirmed', label: 'Accept' }];
   }
   return quickActions(order.status);
+}
+
+function useLayoutScale() {
+  const { width, height } = useWindowDimensions();
+  const short = Math.min(width, height) < 360;
+  const narrow = width < 380;
+  const pad = narrow ? 12 : 18;
+  const tabReserve = 96 + (Platform.OS === 'ios' ? 8 : 0);
+  return { width, height, short, narrow, pad, tabReserve };
 }
 
 function mediaUrl(path?: string | null) {
@@ -1076,12 +1126,13 @@ function AuthScreen({ onDone }: { onDone: () => void }) {
   }
 
   return (
-    <ScrollView style={s.authScreen} contentContainerStyle={s.authWrap} keyboardShouldPersistTaps="handled">
+    <KeyboardAvoidingView style={s.authScreen} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+    <ScrollView style={{ flex: 1 }} contentContainerStyle={s.authWrap} keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag">
       <View style={s.loginBrand}>
         <Image source={LOGO} style={s.authLogo} resizeMode="contain" />
       </View>
       <Text style={s.loginTitle}>Welcome to ZepMed</Text>
-      <Text style={s.loginSub}>Your premium healthcare & medicine companion</Text>
+      <Text style={s.loginSub}>Seller partner app for pharmacy orders</Text>
 
       {tab === 'otp' ? (
         <>
@@ -1138,6 +1189,7 @@ function AuthScreen({ onDone }: { onDone: () => void }) {
       {error ? <Notice tone="error" title={error} /> : notice.includes('OTP sent') ? <Notice tone="success" title={notice} /> : null}
       <Text style={s.termsText}>By continuing, you agree to our <Text style={s.termsLink} onPress={() => Linking.openURL('https://zepmed.org/terms')}>Terms of Service</Text> and <Text style={s.termsLink} onPress={() => Linking.openURL('https://zepmed.org/privacy')}>Privacy Policy</Text></Text>
     </ScrollView>
+    </KeyboardAvoidingView>
   );
 }
 
@@ -1316,23 +1368,42 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
 
   async function action(orderId: number, code: string) {
     try {
-      const message = ['confirmed', 'preparing', 'ready_for_pickup', 'rejected', 'cancelled'].includes(code)
+      const current = orders.find((o) => o.id === orderId);
+      if (code === 'ready_for_pickup') {
+        if (orderAlreadyReadyOrPast(current?.status)) {
+          Alert.alert('Ready', 'Order is already ready for pickup');
+          return;
+        }
+        if (!orderCanMarkReady(current?.status)) {
+          Alert.alert('Ready', 'Accept the order first, then mark Ready');
+          return;
+        }
+        const res = await markOrderReadyOnce(orderId, current?.status);
+        await cancelOrderNotification(orderId);
+        setFresh((f) => f?.id === orderId ? null : f);
+        const nextStatus = typeof res.data?.status === 'string' ? String(res.data.status) : 'ready_for_pickup';
+        setOrders((list) => list.map((order) => (
+          order.id === orderId ? { ...order, status: nextStatus } : order
+        )));
+        if (!res.skipped && res.auto_assigned) Alert.alert('Ready', 'Delivery partner auto-assigned');
+        else if (!res.skipped) Alert.alert('Ready', 'Marked ready — delivery partners notified');
+        await refresh(true, true);
+        return;
+      }
+      const message = ['confirmed', 'preparing', 'rejected', 'cancelled'].includes(code)
         ? readyActionMessage(code)
         : undefined;
       const res = await sellerApi.orderAction(orderId, code, message);
       await cancelOrderNotification(orderId);
-      setFresh((current) => current?.id === orderId ? null : current);
+      setFresh((currentFresh) => currentFresh?.id === orderId ? null : currentFresh);
       const nextStatus = code === 'rx_accept'
         ? 'confirmed'
         : (typeof res.data?.status === 'string' ? String(res.data.status) : code);
-      setOrders((current) => current.map((order) => (
+      setOrders((list) => list.map((order) => (
         order.id === orderId
           ? { ...order, status: nextStatus, seller_confirmed_at: order.seller_confirmed_at || new Date().toISOString() }
           : order
       )));
-      if (code === 'ready_for_pickup' && res.data?.auto_assigned) {
-        Alert.alert('Ready', 'Delivery partner auto-assigned');
-      }
       await refresh(true, true);
     } catch (err) {
       Alert.alert('Action failed', errorMessage(err));
@@ -1375,8 +1446,13 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
           onOpenNotifications={() => setMoreModule('notifications')}
         />
       </View>
-      <ScrollView refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => refresh()} tintColor={C.teal} />} contentContainerStyle={s.body}>
-        {fresh ? <FreshBanner order={fresh} onClose={() => setFresh(null)} onOpen={() => openOrder(fresh.id)} /> : null}
+      <ScrollView
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => refresh()} tintColor={C.teal} />}
+        contentContainerStyle={[s.body, { paddingBottom: 110 + Math.max(insets.bottom, 10) }]}
+        keyboardShouldPersistTaps="handled"
+        keyboardDismissMode="on-drag"
+      >
+        {fresh ? <FreshBanner order={fresh} onOpen={() => openOrder(fresh.id)} onClose={() => setFresh(null)} /> : null}
         {error ? <Notice tone="error" title={error} /> : null}
         {tab === 'home' ? <HomeScreen dash={dash} orders={orders} onOpenOrder={openOrder} onAction={action} onDashboardTarget={openDashboardTarget} onStoreToggle={toggleStoreOpen} /> : null}
         {tab === 'orders' ? <OrdersScreen orders={orders} filter={orderFilter} onFilter={setOrderFilter} onOpenOrder={openOrder} onAction={action} /> : null}
@@ -1426,68 +1502,85 @@ function HomeScreen({
   onDashboardTarget: (target: DashboardTarget) => void;
   onStoreToggle: (nextOpen: boolean) => void;
 }) {
+  const { narrow } = useLayoutScale();
   if (!dash) return <CenteredLoader />;
   const open = dash.is_open !== false && dash.is_open !== 0;
-  // Pending = not yet accepted only (placed/new/prescription_review). Do NOT use pending_dispatch
-  // which also counts confirmed/preparing/ready_for_pickup ("Pending Dispatch" on web panel).
+  // Pending = not yet accepted only (placed/new/prescription_review). Do NOT use pending_dispatch.
   const pendingCount = orders.filter((o) => pendingStatus(o.status)).length;
-  const preparingCount = orders.filter((o) => ['confirmed', 'preparing', 'partial_forward'].includes((o.status || '').toLowerCase())).length;
-  const readyCount = orders.filter((o) => (o.status || '').toLowerCase() === 'ready_for_pickup').length;
+  const preparingCount = orders.filter((o) => ['confirmed', 'preparing', 'partial_forward'].includes(orderStatusKey(o.status))).length;
+  const readyCount = orders.filter((o) => orderStatusKey(o.status) === 'ready_for_pickup').length;
+  const recent = orders.slice(0, narrow ? 4 : 6);
   return (
     <>
       <View style={s.dashboardCard}>
         <View style={s.rowBetween}>
-          <View>
-            <Text style={s.bigTitle}>{dash.pharmacy?.name || 'Your pharmacy'}</Text>
-            <Text style={s.muted}>{dash.pharmacy?.city || 'Open for orders'} • Open for orders</Text>
+          <View style={{ flex: 1, minWidth: 0 }}>
+            <Text style={s.bigTitle} numberOfLines={2}>{dash.pharmacy?.name || 'Your pharmacy'}</Text>
+            <Text style={s.muted} numberOfLines={1}>{dash.pharmacy?.city || 'Seller dashboard'}</Text>
           </View>
           <Pill text={open ? 'Open' : 'Closed'} tone={open ? 'green' : 'red'} />
         </View>
         <TouchableOpacity style={[s.storeToggle, open ? s.storeToggleOpen : s.storeToggleClosed]} onPress={() => onStoreToggle(!open)}>
-          <View>
+          <View style={{ flex: 1, minWidth: 0 }}>
             <Text style={[s.storeToggleTitle, { color: open ? C.green : C.red }]}>{open ? 'Store is open' : 'Store is closed'}</Text>
-            <Text style={[s.storeToggleBody, { color: open ? C.green : C.red }]}>{open ? 'Tap to stop receiving new customer orders' : 'Tap to start receiving new customer orders'}</Text>
+            <Text style={[s.storeToggleBody, { color: open ? C.green : C.red }]} numberOfLines={2}>
+              {open ? 'Tap to pause new customer orders' : 'Tap to receive new customer orders'}
+            </Text>
           </View>
           <Text style={[s.storeToggleAction, { color: open ? C.green : C.red }]}>{open ? 'Close' : 'Open'}</Text>
         </TouchableOpacity>
+
+        <Text style={s.dashSectionLabel}>Order status</Text>
+        <View style={s.statusStrip}>
+          <StatusHero
+            label="Pending accept"
+            hint="Not accepted yet"
+            value={String(pendingCount)}
+            tone="warm"
+            onPress={() => onDashboardTarget('pending')}
+          />
+          <StatusHero
+            label="Preparing"
+            hint="Confirmed / prepping"
+            value={String(preparingCount)}
+            tone="blue"
+            onPress={() => onDashboardTarget('orders')}
+          />
+          <StatusHero
+            label="Ready"
+            hint="Awaiting delivery"
+            value={String(readyCount)}
+            tone="green"
+            onPress={() => onDashboardTarget('orders')}
+          />
+        </View>
+
+        <Text style={s.dashSectionLabel}>Today overview</Text>
         <View style={s.summaryGrid}>
-          <SummaryTile label="Total Orders" value={String(dash.orders_total ?? 0)} onPress={() => onDashboardTarget('orders')} />
+          <SummaryTile label="Total orders" value={String(dash.orders_total ?? 0)} onPress={() => onDashboardTarget('orders')} />
           <SummaryTile label="Revenue" value={shortMoney(dash.revenue_total)} onPress={() => onDashboardTarget('revenue')} />
-          <SummaryTile label="Pending" value={String(pendingCount)} onPress={() => onDashboardTarget('pending')} />
           <SummaryTile label="Delivered" value={String(dash.delivered_count ?? 0)} onPress={() => onDashboardTarget('delivered')} />
-        </View>
-        <View style={[s.statRow, { marginTop: 10 }]}>
-          <StatCard label="Awaiting accept" value={String(pendingCount)} warm />
-          <StatCard label="Preparing" value={String(preparingCount)} />
-        </View>
-        <View style={[s.statRow, { marginTop: 8 }]}>
-          <StatCard label="Ready to pick up" value={String(readyCount)} />
-          <StatCard label="In pipeline" value={String(dash.pending_dispatch ?? pendingCount + preparingCount + readyCount)} />
+          <SummaryTile label="Wallet" value={shortMoney(dash.pharmacy_wallet_balance)} onPress={() => onDashboardTarget('orders')} />
         </View>
       </View>
-      <View style={[s.infoCard, { backgroundColor: C.blueSoft }]}>
-        <Text style={[s.infoTitle, { color: C.blue }]}>Global catalog synced</Text>
-        <Text style={[s.infoText, { color: C.blue }]}>Products update when orders are confirmed</Text>
-      </View>
+
       {(dash.inventory_low_stock ?? 0) > 0 ? (
         <View style={[s.infoCard, { backgroundColor: C.yellowSoft }]}>
-          <Text style={[s.infoTitle, { color: C.yellow }]}>{dash.inventory_low_stock} products are low in stock</Text>
-          <Text style={[s.infoText, { color: C.yellow }]}>Review stock or purchase from a wholeseller.</Text>
+          <Text style={[s.infoTitle, { color: C.yellow }]}>{dash.inventory_low_stock} products low in stock</Text>
+          <Text style={[s.infoText, { color: C.yellow }]}>Review stock or buy from a wholesaler.</Text>
         </View>
       ) : null}
       {dash.drug_license?.message ? (
         <View style={[s.infoCard, { backgroundColor: dash.drug_license.restricted ? C.redSoft : C.yellowSoft }]}>
           <Text style={[s.infoTitle, { color: dash.drug_license.restricted ? C.red : C.yellow }]}>Drug license {dash.drug_license.status || ''}</Text>
-          <Text style={[s.infoText, { color: dash.drug_license.restricted ? C.red : C.yellow }]}>{dash.drug_license.message}{dash.drug_license.expiry_date ? ` • Expires ${dash.drug_license.expiry_date}` : ''}</Text>
+          <Text style={[s.infoText, { color: dash.drug_license.restricted ? C.red : C.yellow }]}>
+            {dash.drug_license.message}{dash.drug_license.expiry_date ? ` • Expires ${dash.drug_license.expiry_date}` : ''}
+          </Text>
         </View>
       ) : null}
-      <View style={s.statRow}>
-        <StatCard label="Wallet" value={shortMoney(dash.pharmacy_wallet_balance)} warm />
-        <StatCard label="Owner" value={dash.owner_name || dash.pharmacy?.name || '-'} />
-      </View>
-      <HomeReferralCard />
+
       <SectionTitle title="Recent orders" right={`${orders.length} total`} />
-      {orders.slice(0, 6).map((o) => <OrderCard key={o.id} order={o} onOpen={() => onOpenOrder(o.id)} onAction={(code) => onAction(o.id, code)} />)}
+      {recent.map((o) => <OrderCard key={o.id} order={o} onOpen={() => onOpenOrder(o.id)} onAction={(code) => onAction(o.id, code)} />)}
       {!orders.length ? <Empty title="No orders yet" body="New customer orders will appear here." /> : null}
     </>
   );
@@ -2450,7 +2543,22 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
   async function run(code: string) {
     setActing(true);
     try {
-      const message = ['confirmed', 'preparing', 'ready_for_pickup', 'rejected', 'cancelled', 'wrong_prescription'].includes(code)
+      if (code === 'ready_for_pickup') {
+        const res = await markOrderReadyOnce(detail.id, detail.status);
+        await cancelOrderNotification(detail.id);
+        const nextStatus = typeof res.data?.status === 'string' ? String(res.data.status) : 'ready_for_pickup';
+        setDetail((current) => current ? { ...current, status: nextStatus } : current);
+        await reload();
+        if (!res.skipped) {
+          const prefs = await readPrefs();
+          if (prefs.autoPrint) await printCurrentBill().catch(() => undefined);
+          if (res.auto_assigned) Alert.alert('Ready', 'Delivery partner auto-assigned');
+          else Alert.alert('Ready', 'Marked ready for pickup — delivery partners notified');
+        }
+        onBack();
+        return;
+      }
+      const message = ['confirmed', 'preparing', 'rejected', 'cancelled', 'wrong_prescription'].includes(code)
         ? readyActionMessage(code)
         : undefined;
       const res = await sellerApi.orderAction(detail.id, code, message);
@@ -2460,13 +2568,6 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
         : (typeof res.data?.status === 'string' ? String(res.data.status) : code);
       setDetail((current) => current ? { ...current, status: nextStatus, seller_confirmed_at: current.seller_confirmed_at || new Date().toISOString() } : current);
       await reload();
-      if (code === 'ready_for_pickup') {
-        const prefs = await readPrefs();
-        if (prefs.autoPrint) await printCurrentBill().catch(() => undefined);
-        if (res.data?.auto_assigned) Alert.alert('Ready', 'Delivery partner auto-assigned');
-        else Alert.alert('Ready', 'Marked ready for pickup — delivery partners notified');
-        onBack();
-      }
     } catch (err) {
       Alert.alert('Order', errorMessage(err));
     } finally {
@@ -2491,19 +2592,24 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
   async function process(finalStatus: string) {
     setActing(true);
     try {
-      // Panel never jumps placed → ready via process for dispatch; accept first, then action ready.
-      // Keep process for confirmed/preparing/rejected only.
+      // Panel: Accept = process(confirmed); Ready = orders/action ONLY (never process ready —
+      // and never POST ready twice — each ready clears delivery_agent_id / exclusive offer).
       if (finalStatus === 'ready_for_pickup') {
-        await sellerApi.processOrder(processPayload('confirmed'));
-        await cancelOrderNotification(detail.id);
-        const res = await sellerApi.orderAction(detail.id, 'ready_for_pickup', readyActionMessage('ready_for_pickup'));
+        if (pendingStatus(detail.status)) {
+          await sellerApi.processOrder(processPayload('confirmed'));
+          await cancelOrderNotification(detail.id);
+          setDetail((current) => current ? { ...current, status: 'confirmed', seller_confirmed_at: current.seller_confirmed_at || new Date().toISOString() } : current);
+        }
+        const res = await markOrderReadyOnce(detail.id, pendingStatus(detail.status) ? 'confirmed' : detail.status);
         const nextStatus = typeof res.data?.status === 'string' ? String(res.data.status) : 'ready_for_pickup';
         setDetail((current) => current ? { ...current, status: nextStatus, seller_confirmed_at: current.seller_confirmed_at || new Date().toISOString() } : current);
         await reload();
-        const prefs = await readPrefs();
-        if (prefs.autoPrint) await printCurrentBill().catch(() => undefined);
-        if (res.data?.auto_assigned) Alert.alert('Ready', 'Delivery partner auto-assigned');
-        else Alert.alert('Ready', 'Marked ready for pickup — delivery partners notified');
+        if (!res.skipped) {
+          const prefs = await readPrefs();
+          if (prefs.autoPrint) await printCurrentBill().catch(() => undefined);
+          if (res.auto_assigned) Alert.alert('Ready', 'Delivery partner auto-assigned');
+          else Alert.alert('Ready', 'Marked ready for pickup — delivery partners notified');
+        }
         onBack();
         return;
       }
@@ -2590,15 +2696,16 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
   return (
     <View style={[s.screen, { paddingTop: insets.top }]}>
       <Header title={rx ? 'Prescription Order' : detail.order_number} subtitle={detail.status.replace(/_/g, ' ')} onRefresh={reload} onLogout={onBack} />
-      <ScrollView contentContainerStyle={s.body}>
-        <TouchableOpacity onPress={onBack}><Text style={s.backText}>‹ Back to orders</Text></TouchableOpacity>
-        <OrderStepper status={detail.status} />
-        {isVirtualShop(detail) ? <VirtualShopBanner order={detail} /> : null}
-        <View style={s.card}>
-          <Text style={s.itemTitle}>{detail.customer_name || 'Customer'} • {detail.customer_phone || '-'}</Text>
-          <Text style={s.muted}>{[detail.address_line, detail.city, detail.pincode].filter(Boolean).join(', ')}</Text>
-          <View style={s.rowBetween}><Text style={s.amount}>Total {money(detail.total_amount)}</Text>{detail.payment_method ? <Pill text={detail.payment_method.toUpperCase()} tone="blue" /> : null}</View>
-        </View>
+      <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined} keyboardVerticalOffset={insets.top + 8}>
+        <ScrollView contentContainerStyle={[s.body, { paddingBottom: 40 + Math.max(insets.bottom, 12) }]} keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag">
+          <TouchableOpacity onPress={onBack}><Text style={s.backText}>‹ Back to orders</Text></TouchableOpacity>
+          <OrderStepper status={detail.status} />
+          {isVirtualShop(detail) ? <VirtualShopBanner order={detail} /> : null}
+          <View style={s.card}>
+            <Text style={s.itemTitle}>{detail.customer_name || 'Customer'} • {detail.customer_phone || '-'}</Text>
+            <Text style={s.muted}>{[detail.address_line, detail.city, detail.pincode].filter(Boolean).join(', ')}</Text>
+            <View style={s.rowBetween}><Text style={s.amount}>Total {money(detail.total_amount)}</Text>{detail.payment_method ? <Pill text={detail.payment_method.toUpperCase()} tone="blue" /> : null}</View>
+          </View>
         {rx && mediaUrl(detail.prescription_url) ? (
           <TouchableOpacity activeOpacity={0.9} onPress={() => setRxImageOpen(true)}>
             <Image source={{ uri: mediaUrl(detail.prescription_url) }} style={s.rxImage} resizeMode="contain" />
@@ -2693,7 +2800,8 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
         ) : null}
         {pending && rx ? <Danger label="Wrong prescription" disabled={acting} onPress={() => run('wrong_prescription')} /> : null}
         {!pending && quickActions(detail.status).map((a) => <Primary key={a.code} label={a.label} disabled={acting} onPress={() => run(a.code)} />)}
-      </ScrollView>
+        </ScrollView>
+      </KeyboardAvoidingView>
       <Modal visible={rxImageOpen} animationType="fade" onRequestClose={() => setRxImageOpen(false)}>
         <View style={s.imageViewer}>
           <TouchableOpacity style={s.imageClose} onPress={() => setRxImageOpen(false)}>
@@ -3195,13 +3303,15 @@ function IntegrationsCard() {
 
 function BottomTabs({ current, setTab, pending }: { current: TabKey; setTab: (tab: TabKey) => void; pending: number }) {
   const insets = useSafeAreaInsets();
+  const { narrow } = useLayoutScale();
   const tabs: Array<[TabKey, string]> = [['home', 'Home'], ['orders', 'Orders'], ['catalog', 'Catalog'], ['stock', 'Stock'], ['more', 'More']];
+  const bottom = Math.max(insets.bottom, 8);
   return (
-    <View style={[s.tabs, { bottom: Math.max(insets.bottom, 10) }]}>
+    <View style={[s.tabs, { bottom: bottom, height: narrow ? 72 : 78, paddingBottom: Math.max(insets.bottom - 8, 0) }]}>
       {tabs.map(([key, label]) => (
         <TouchableOpacity key={key} style={[s.tab, current === key && s.tabActive]} onPress={() => setTab(key)} activeOpacity={0.85}>
           <AnimatedTabLogo source={TAB_LOGOS[key]} active={current === key} badge={key === 'orders' && pending > 0 ? (pending > 9 ? '9+' : String(pending)) : undefined} />
-          <Text style={[s.tabLabel, current === key && s.tabTextActive]}>{label}</Text>
+          <Text style={[s.tabLabel, current === key && s.tabTextActive]} numberOfLines={1}>{label}</Text>
         </TouchableOpacity>
       ))}
     </View>
@@ -3317,14 +3427,43 @@ function Kpi({ label, value, tone, onPress }: { label: string; value: string; to
 function SummaryTile({ label, value, onPress }: { label: string; value: string; onPress: () => void }) {
   return (
     <TouchableOpacity style={s.summaryTile} activeOpacity={0.82} onPress={onPress}>
-      <Text style={s.summaryLabel}>{label}</Text>
-      <Text style={s.summaryValue}>{value}</Text>
+      <Text style={s.summaryLabel} numberOfLines={1}>{label}</Text>
+      <Text style={s.summaryValue} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.7}>{value}</Text>
+    </TouchableOpacity>
+  );
+}
+
+function StatusHero({
+  label,
+  hint,
+  value,
+  tone,
+  onPress,
+}: {
+  label: string;
+  hint: string;
+  value: string;
+  tone: 'warm' | 'blue' | 'green';
+  onPress: () => void;
+}) {
+  const bg = tone === 'warm' ? C.yellowSoft : tone === 'green' ? C.greenSoft : C.blueSoft;
+  const fg = tone === 'warm' ? C.yellow : tone === 'green' ? C.green : C.blue;
+  return (
+    <TouchableOpacity style={[s.statusHero, { backgroundColor: bg }]} activeOpacity={0.85} onPress={onPress}>
+      <Text style={[s.statusHeroValue, { color: fg }]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.65}>{value}</Text>
+      <Text style={[s.statusHeroLabel, { color: fg }]} numberOfLines={2}>{label}</Text>
+      <Text style={s.statusHeroHint} numberOfLines={1}>{hint}</Text>
     </TouchableOpacity>
   );
 }
 
 function StatCard({ label, value, warm }: { label: string; value: string; warm?: boolean }) {
-  return <View style={[s.statCard, warm && { backgroundColor: C.yellowSoft }]}><Text style={s.kpiLabel}>{label}</Text><Text style={[s.statValue, warm && { color: C.yellow }]}>{value}</Text></View>;
+  return (
+    <View style={[s.statCard, warm && { backgroundColor: C.yellowSoft }]}>
+      <Text style={s.kpiLabel} numberOfLines={2}>{label}</Text>
+      <Text style={[s.statValue, warm && { color: C.yellow }]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.7}>{value}</Text>
+    </View>
+  );
 }
 
 function Info({ label, value }: { label: string; value: string }) {
@@ -3418,8 +3557,14 @@ const s = StyleSheet.create({
   notifMarkHint: { color: C.muted, fontSize: 11, fontWeight: '800' },
   moreTileBadge: { position: 'absolute', right: 10, top: 10, minWidth: 18, height: 18, borderRadius: 9, backgroundColor: C.redAccent, color: '#FFF', fontWeight: '900', textAlign: 'center', overflow: 'hidden', fontSize: 10, lineHeight: 18, paddingHorizontal: 3 },
   iconText: { color: C.muted, fontSize: 22, fontWeight: '900' },
-  body: { paddingHorizontal: 18, paddingBottom: 128, gap: 14 },
-  dashboardCard: { backgroundColor: '#FFF', borderRadius: 22, borderWidth: 1, borderColor: C.line, padding: 18, gap: 16, shadowColor: C.teal, shadowOpacity: 0.08, shadowRadius: 18, shadowOffset: { width: 0, height: 10 }, elevation: 3 },
+  body: { paddingHorizontal: 16, paddingBottom: 128, gap: 14 },
+  dashboardCard: { backgroundColor: '#FFF', borderRadius: 22, borderWidth: 1, borderColor: C.line, padding: 16, gap: 14, shadowColor: C.teal, shadowOpacity: 0.08, shadowRadius: 18, shadowOffset: { width: 0, height: 10 }, elevation: 3 },
+  dashSectionLabel: { color: C.muted, fontSize: 12, fontWeight: '800', textTransform: 'uppercase', letterSpacing: 0.4, marginTop: 2 },
+  statusStrip: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  statusHero: { flexGrow: 1, flexBasis: '30%', minWidth: 96, maxWidth: '100%', borderRadius: 16, paddingVertical: 12, paddingHorizontal: 10, gap: 2 },
+  statusHeroValue: { fontSize: 28, fontWeight: '900', lineHeight: 32 },
+  statusHeroLabel: { fontSize: 12, fontWeight: '800', lineHeight: 16 },
+  statusHeroHint: { color: C.muted, fontSize: 11, lineHeight: 14, marginTop: 2 },
   card: { backgroundColor: '#FFF', borderRadius: 18, borderWidth: 1, borderColor: C.line, padding: 16, gap: 10, shadowColor: '#0F766E', shadowOpacity: 0.04, shadowRadius: 10, shadowOffset: { width: 0, height: 4 }, elevation: 1 },
   rowBetween: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: 12 },
   bigTitle: { color: C.ink, fontWeight: '900', fontSize: 20 },
@@ -3436,7 +3581,7 @@ const s = StyleSheet.create({
   storeToggleBody: { fontSize: 12, marginTop: 4 },
   storeToggleAction: { fontSize: 14, fontWeight: '900' },
   summaryGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
-  summaryTile: { width: '47.9%', minHeight: 70, borderRadius: 14, borderWidth: 1, borderColor: C.line, backgroundColor: C.surface, padding: 12, justifyContent: 'center' },
+  summaryTile: { flexGrow: 1, flexBasis: '46%', minWidth: 140, minHeight: 70, borderRadius: 14, borderWidth: 1, borderColor: C.line, backgroundColor: C.surface, padding: 12, justifyContent: 'center' },
   summaryLabel: { color: C.muted, fontSize: 11, fontWeight: '900' },
   summaryValue: { color: C.ink, fontSize: 21, fontWeight: '900', marginTop: 5 },
   infoCard: { borderRadius: 16, padding: 16 },
@@ -3467,8 +3612,8 @@ const s = StyleSheet.create({
   segmentDark: { backgroundColor: C.ink },
   segmentText: { color: C.muted, fontSize: 12, fontWeight: '900' },
   count: { color: C.muted, fontSize: 14, fontWeight: '800' },
-  statRow: { flexDirection: 'row', gap: 18 },
-  statCard: { flex: 1, backgroundColor: '#FFF', borderRadius: 16, borderWidth: 1, borderColor: C.line, padding: 16, minHeight: 82 },
+  statRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
+  statCard: { flexGrow: 1, flexBasis: '46%', minWidth: 140, backgroundColor: '#FFF', borderRadius: 16, borderWidth: 1, borderColor: C.line, padding: 14, minHeight: 82 },
   statValue: { color: C.ink, fontWeight: '900', fontSize: 28, marginTop: 8 },
   smallChip: { alignSelf: 'flex-start', paddingHorizontal: 14, height: 30, borderRadius: 18, backgroundColor: C.beige, justifyContent: 'center' },
   smallChipText: { color: C.muted, fontWeight: '900', fontSize: 12 },
@@ -3516,7 +3661,7 @@ const s = StyleSheet.create({
   step: { alignItems: 'center', flex: 1 },
   stepDot: { color: C.muted, fontSize: 18 },
   stepText: { color: C.muted, fontSize: 11, fontWeight: '800', marginTop: 4 },
-  tabs: { position: 'absolute', left: 12, right: 12, bottom: 10, height: 78, backgroundColor: '#FFFFFF', borderRadius: 28, borderWidth: 1, borderColor: '#E3EEEC', flexDirection: 'row', justifyContent: 'space-around', alignItems: 'center', paddingHorizontal: 6, shadowColor: '#0F766E', shadowOpacity: 0.16, shadowRadius: 18, shadowOffset: { width: 0, height: 8 }, elevation: 14 },
+  tabs: { position: 'absolute', left: 8, right: 8, bottom: 10, height: 78, backgroundColor: '#FFFFFF', borderRadius: 24, borderWidth: 1, borderColor: '#E3EEEC', flexDirection: 'row', justifyContent: 'space-around', alignItems: 'center', paddingHorizontal: 4, shadowColor: '#0F766E', shadowOpacity: 0.16, shadowRadius: 18, shadowOffset: { width: 0, height: 8 }, elevation: 14 },
   tab: { minWidth: 60, height: 66, borderRadius: 22, alignItems: 'center', justifyContent: 'center' },
   tabActive: { backgroundColor: C.tealSoft },
   tabLogo: { width: 36, height: 36, borderRadius: 18, alignItems: 'center', justifyContent: 'center', backgroundColor: '#F4FAF9', overflow: 'hidden' },
@@ -3534,7 +3679,7 @@ const s = StyleSheet.create({
   newOrderBody: { color: C.ink, fontSize: 16, fontWeight: '800' },
   newOrderHint: { color: C.muted, fontSize: 12, textAlign: 'center', lineHeight: 18, marginBottom: 4 },
   moreGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
-  moreTile: { width: '47.8%', minHeight: 108, borderRadius: 20, backgroundColor: '#FFF', borderWidth: 1, borderColor: C.line, padding: 14, justifyContent: 'flex-start', shadowColor: C.teal, shadowOpacity: 0.05, shadowRadius: 8, shadowOffset: { width: 0, height: 4 }, elevation: 1, position: 'relative' },
+  moreTile: { flexGrow: 1, flexBasis: '46%', minWidth: 140, minHeight: 108, borderRadius: 20, backgroundColor: '#FFF', borderWidth: 1, borderColor: C.line, padding: 14, justifyContent: 'flex-start', shadowColor: C.teal, shadowOpacity: 0.05, shadowRadius: 8, shadowOffset: { width: 0, height: 4 }, elevation: 1, position: 'relative' },
   moreTileIcon: { fontSize: 22, marginBottom: 8 },
   moreTileTitle: { color: C.ink, fontSize: 15, fontWeight: '900' },
   moreTileBody: { color: C.muted, fontSize: 12, lineHeight: 16, marginTop: 4 },
