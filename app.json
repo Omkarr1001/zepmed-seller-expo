@@ -3,6 +3,9 @@
     "name": "ZepMed Seller",
     "slug": "zepmed-seller",
     "version": "1.0.1",
+    "plugins": [
+      "./plugins/withZepMedPrinter.js"
+    ],
     "orientation": "portrait",
     "icon": "./assets/ic_launcher.png",
     "userInterfaceStyle": "light",
