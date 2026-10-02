@@ -6,6 +6,7 @@ const PREF_KEY = 'zepmed:seller:prefs';
 type NativePrinter = {
   getPairedPrinters: () => Promise<Array<{ address: string; name: string }>>;
   printBase64: (macAddress: string, payload: string) => Promise<boolean>;
+  printBase64WithTrailing?: (macAddress: string, payload: string, trailing: string) => Promise<boolean>;
 };
 
 export type PairedPrinter = { address: string; name: string };
@@ -56,7 +57,8 @@ export async function listPairedPrinters(): Promise<PairedPrinter[]> {
   if (!ok) throw new Error('Allow Bluetooth permission to list printers');
   const module = nativePrinter();
   if (!module) throw new Error('Bluetooth printer module is not available in this build');
-  return module.getPairedPrinters();
+  const rows = await module.getPairedPrinters();
+  return (rows || []).slice().sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), undefined, { sensitivity: 'base' }));
 }
 
 function toBase64(bytes: Uint8Array) {
@@ -65,10 +67,23 @@ function toBase64(bytes: Uint8Array) {
   return global.btoa(bin);
 }
 
-export async function printToBluetooth(mac: string, bytes: Uint8Array) {
+export async function printToBluetooth(mac: string, bytes: Uint8Array, trailing: Uint8Array = new Uint8Array()) {
   const ok = await requestBluetoothPermission();
   if (!ok) throw new Error('Allow Bluetooth permission to print');
   const module = nativePrinter();
   if (!module) throw new Error('Bluetooth printer module is not available in this build');
-  await module.printBase64(mac, toBase64(bytes));
+  const payload = toBase64(bytes);
+  if (trailing.length && module.printBase64WithTrailing) {
+    await module.printBase64WithTrailing(mac, payload, toBase64(trailing));
+    return;
+  }
+  if (trailing.length) {
+    // Fallback: append after a short marker pause is handled natively when available.
+    const merged = new Uint8Array(bytes.length + trailing.length);
+    merged.set(bytes, 0);
+    merged.set(trailing, bytes.length);
+    await module.printBase64(mac, toBase64(merged));
+    return;
+  }
+  await module.printBase64(mac, payload);
 }

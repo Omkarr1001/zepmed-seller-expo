@@ -2036,7 +2036,7 @@ function PrinterSettingsScreen({ dash }: { dash: DashboardData | null }) {
       <View style={s.heroCard}>
         <Text style={s.heroKicker}>Bill printing</Text>
         <Text style={s.bigTitle}>Same shop printer as the seller panel</Text>
-        <Text style={s.muted}>Pair the printer in Android Bluetooth settings, select it here, then print. Thermal bills go over Bluetooth with no extra blank paper after the tear.</Text>
+        <Text style={s.muted}>Pair the Milestone 523-L58P (or ESC/POS) printer in Android Bluetooth settings, select it here, set Language to tspl (default), Save, then Print sample. Same TSPL commands as the seller web panel.</Text>
       </View>
       <TouchableOpacity style={[s.choiceCard, (p.type || 'thermal_58') === 'thermal_58' && s.choiceCardOn]} onPress={() => updatePrinter({ type: 'thermal_58' })}>
         <Text style={s.itemTitle}>Thermal 58 mm</Text>
