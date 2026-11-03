@@ -11,6 +11,8 @@ import { csvFromRows, printBill, shareBillPdf, type PrinterLayout } from './prin
 import { prepareOrderBell, startOrderBell, stopOrderBell } from './orderBell';
 import { listPairedPrinters, readSellerPrefs, writeSellerPrefs, type PairedPrinter } from './printerNative';
 import { setOrderWatchSound, silenceNativeOrder, startOrderWatch, stopOrderWatch } from './orderWatch';
+import { formatForwardPharmacy, nearbyRetailOnly } from './nearbyForward';
+import { hydrateMutedOrderIds, isOrderMuted, muteOrder, subscribeMutedOrders, unmuteOrder } from './mutedOrders';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -193,7 +195,7 @@ type OrderLineItem = {
   forwarded_to_me?: boolean | null;
   fulfilled_by_me?: boolean | null;
 };
-type ForwardPharmacy = { id: number; name?: string | null; city?: string | null; nearby_label?: string | null; distance_km?: number | null };
+type ForwardPharmacy = { id: number; name?: string | null; city?: string | null; nearby_label?: string | null; distance_km?: number | null; pincode?: string | null };
 type OrderDetail = Order & {
   customer_phone?: string | null;
   seller_notes?: string | null;
@@ -468,6 +470,10 @@ function forgetSettledSilenced(orders: Order[]) {
     const order = orders.find((item) => item.id === id);
     if (!order || !pendingStatus(order.status) || order.seller_confirmed_at) silencedOrderIds.delete(id);
   }
+}
+
+function withNearbyForward(order: OrderDetail): OrderDetail {
+  return { ...order, forward_pharmacies: nearbyRetailOnly(order.forward_pharmacies) };
 }
 
 function orderStatusKey(status?: string | null) {
@@ -833,7 +839,8 @@ async function syncPendingOrderNotifications(orders: Order[], opts?: { forcePres
     return;
   }
 
-  if (alertableOrders.length && appActive) await startOrderBell(true);
+  const ringingOrders = alertableOrders.filter((order) => !isOrderMuted(order.id));
+  if (ringingOrders.length && appActive) await startOrderBell(true);
   else await stopOrderBell();
 
   for (const [orderId, notificationId] of Object.entries(current)) {
@@ -997,6 +1004,19 @@ const sellerApi = {
   subscribePlan: (planId: number) => request<SubscriptionInfo>('seller/subscription/subscribe', { body: { plan_id: planId, payment_method: 'demo', demo_card: '4242 4242 4242 4242', simulate: 'success', use_wallet: 1 } }),
 };
 
+async function ensureNearbyForward(order: OrderDetail): Promise<OrderDetail> {
+  let list = nearbyRetailOnly(order.forward_pharmacies);
+  if (!list.length) {
+    try {
+      const fwd = await sellerApi.forwardPharmacies(order.pincode || undefined);
+      list = nearbyRetailOnly(fwd.data?.items);
+    } catch {
+      // Order can still be processed without a forward list.
+    }
+  }
+  return { ...order, forward_pharmacies: list };
+}
+
 TaskManager.defineTask(ORDER_POLL_TASK, async () => {
   try {
     const session = await readSession();
@@ -1008,6 +1028,7 @@ TaskManager.defineTask(ORDER_POLL_TASK, async () => {
     }
     const response = await sellerApi.orders();
     const orders = response.data?.items ?? [];
+    await hydrateMutedOrderIds();
     await syncPendingOrderNotifications(orders);
     return orders.some((order) => pendingStatus(order.status))
       ? BackgroundFetch.BackgroundFetchResult.NewData
@@ -1258,8 +1279,9 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
       const firstFresh = next.find((order) => !knownOrders.current.has(order.id) && orderCanShowNewPopup(order));
       if (knownOrders.current.size && firstFresh) {
         setFresh(firstFresh);
-        // Ring immediately while seller may be on Home/Catalog/More — do not wait for Orders tab.
-        void startOrderBell(true);
+        // Ring immediately while seller may be on Home/Catalog/More — skip if this order is muted.
+        if (!isOrderMuted(firstFresh.id)) void startOrderBell(true);
+        else void stopOrderBell();
       }
       knownOrders.current = new Set(next.map((order) => order.id));
       setOrders(next);
@@ -1290,9 +1312,17 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
   }, []);
 
   useEffect(() => {
-    refresh(true);
-    const timer = setInterval(() => refresh(true), 15000);
-    return () => clearInterval(timer);
+    let timer: ReturnType<typeof setInterval> | undefined;
+    let cancelled = false;
+    hydrateMutedOrderIds().finally(() => {
+      if (cancelled) return;
+      refresh(true);
+      timer = setInterval(() => refresh(true), 15000);
+    });
+    return () => {
+      cancelled = true;
+      if (timer) clearInterval(timer);
+    };
   }, [refresh]);
 
   useEffect(() => {
@@ -1357,10 +1387,10 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
 
   async function openOrder(id: number) {
     const seed = orders.find((order) => order.id === id);
-    if (seed) setSelectedOrder(seed as OrderDetail);
+    if (seed) setSelectedOrder(withNearbyForward(seed as OrderDetail));
     try {
       const detail = await sellerApi.orderDetail(id);
-      setSelectedOrder(detail.data ?? null);
+      setSelectedOrder(detail.data ? await ensureNearbyForward(detail.data) : null);
     } catch (err) {
       Alert.alert('Order', errorMessage(err));
     }
@@ -2481,7 +2511,7 @@ function PayoutsScreen() {
 
 function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: DashboardData | null; onBack: () => void }) {
   const insets = useSafeAreaInsets();
-  const [detail, setDetail] = useState(order);
+  const [detail, setDetail] = useState(() => withNearbyForward(order));
   const [notes, setNotes] = useState(order.seller_notes || '');
   const [acting, setActing] = useState(false);
   const [fulfill, setFulfill] = useState<Record<number, string>>({});
@@ -2498,18 +2528,14 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
     setFulfill(next);
   }, [detail.id]);
 
+  useEffect(() => {
+    setDetail(withNearbyForward(order));
+    ensureNearbyForward(order).then(setDetail).catch(() => undefined);
+  }, [order]);
+
   async function reload() {
     const res = await sellerApi.orderDetail(detail.id);
-    if (res.data) {
-      const next = res.data;
-      if (!next.forward_pharmacies?.length) {
-        try {
-          const fwd = await sellerApi.forwardPharmacies(next.pincode || undefined);
-          next.forward_pharmacies = fwd.data?.items ?? [];
-        } catch { /* order can still be processed without forward list */ }
-      }
-      setDetail(next);
-    }
+    if (res.data) setDetail(await ensureNearbyForward(res.data));
   }
 
   function updateRxRow(index: number, next: Partial<RxMedicineRow>) {
@@ -2693,6 +2719,8 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
 
   const pending = pendingStatus(detail.status);
   const rx = detail.is_prescription_order || isPrescription(detail);
+  const nearbyForward = nearbyRetailOnly(detail.forward_pharmacies);
+  const firstNearbyId = String(nearbyForward[0]?.id || '');
   return (
     <View style={[s.screen, { paddingTop: insets.top }]}>
       <Header title={rx ? 'Prescription Order' : detail.order_number} subtitle={detail.status.replace(/_/g, ' ')} onRefresh={reload} onLogout={onBack} />
@@ -2748,12 +2776,12 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
               <Text style={s.itemTitle}>{item.product_name || 'Item'}</Text>
               <Text style={s.muted}>Ordered {item.quantity ?? 0} • {item.catalog_note || 'New on confirm'} • {money(item.price)}</Text>
               {pending && !rx ? <Field label="Fulfill" value={fulfill[item.id] || '0'} onChangeText={(v) => setFulfill((m) => ({ ...m, [item.id]: v.replace(/\D/g, '') }))} keyboardType="number-pad" compact /> : null}
-              {pending && !rx && (detail.forward_pharmacies?.length || dash?.pharmacy) ? (
+              {pending && !rx && (nearbyForward.length || dash?.pharmacy) ? (
                 <View style={s.inputRow}>
-                  <Field label="Forward qty" value={forward[item.id]?.qty || ''} onChangeText={(v) => setForward((m) => ({ ...m, [item.id]: { qty: v.replace(/\D/g, ''), pharmacyId: m[item.id]?.pharmacyId || String(detail.forward_pharmacies?.[0]?.id || '') } }))} compact />
+                  <Field label="Forward qty" value={forward[item.id]?.qty || ''} onChangeText={(v) => setForward((m) => ({ ...m, [item.id]: { qty: v.replace(/\D/g, ''), pharmacyId: m[item.id]?.pharmacyId || firstNearbyId } }))} compact />
                   <Field
                     label="Forward pharmacy id"
-                    value={forward[item.id]?.pharmacyId || String(detail.forward_pharmacies?.[0]?.id || '')}
+                    value={forward[item.id]?.pharmacyId || firstNearbyId}
                     onChangeText={(v) => setForward((m) => ({ ...m, [item.id]: { qty: m[item.id]?.qty || '', pharmacyId: v.replace(/\D/g, '') } }))}
                     compact
                   />
@@ -2762,10 +2790,12 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
             </View>
           ))
         )}
-        {detail.forward_pharmacies?.length ? (
+        {nearbyForward.length ? (
           <View style={s.card}>
-            <Text style={s.itemTitle}>Nearby pharmacies to forward</Text>
-            {detail.forward_pharmacies.map((p) => <Text key={p.id} style={s.muted}>#{p.id} {p.name} • {p.city || p.nearby_label || ''} {p.distance_km != null ? `• ${p.distance_km} km` : ''}</Text>)}
+            <Text style={s.itemTitle}>Nearby Pharmacies to Forward</Text>
+            {nearbyForward.map((p) => (
+              <Text key={p.id} style={s.muted}>#{p.id} {formatForwardPharmacy(p)}{p.distance_km != null ? ` • ${p.distance_km} km` : ''}</Text>
+            ))}
           </View>
         ) : null}
         <Field label="Notes to customer" value={notes} onChangeText={setNotes} multiline />
@@ -3070,15 +3100,46 @@ function FreshBanner({ order, onOpen, onClose }: { order: Order; onOpen: () => v
 }
 
 function NewOrderPopup({ order, onOpen, onClose }: { order: Order | null; onOpen: () => void; onClose: () => void }) {
+  const [muted, setMuted] = useState(order ? isOrderMuted(order.id) : false);
+  useEffect(() => {
+    setMuted(order ? isOrderMuted(order.id) : false);
+    return subscribeMutedOrders(() => setMuted(order ? isOrderMuted(order.id) : false));
+  }, [order?.id]);
+
+  async function toggleMute() {
+    if (!order) return;
+    if (muted) {
+      await unmuteOrder(order.id);
+      setMuted(false);
+      const prefs = await readPrefs();
+      if (prefs.sound) void startOrderBell(true);
+    } else {
+      await muteOrder(order.id);
+      silenceNativeOrder(order.id);
+      setMuted(true);
+      await stopOrderBell();
+    }
+  }
+
   return (
     <Modal visible={Boolean(order)} transparent animationType="fade" onRequestClose={onClose}>
       <View style={s.modalShade}>
         <View style={s.newOrderModal}>
+          <Pressable
+            onPress={toggleMute}
+            accessibilityRole="button"
+            accessibilityLabel={muted ? 'Unmute order bell' : 'Mute order bell'}
+            hitSlop={12}
+            style={s.popupBellButton}
+          >
+            <Text style={s.popupBell}>{muted ? '🔕' : '🔔'}</Text>
+            <Text style={s.popupBellHint}>{muted ? 'Muted — tap to ring' : 'Tap bell to mute'}</Text>
+          </Pressable>
           <Image source={LOGO} style={s.authLogo} resizeMode="contain" />
-          <Text style={s.newOrderTitle}>New order received</Text>
+          <Text style={s.newOrderTitle}>New order received!</Text>
           <Text style={s.newOrderNo}>{order?.order_number}</Text>
           <Text style={s.newOrderBody}>{order?.customer_name || 'Customer'} • {money(order?.total_amount)}</Text>
-          <Text style={s.newOrderHint}>Notifications will continue until this order is accepted or moved out of pending.</Text>
+          <Text style={s.newOrderHint}>{muted ? 'Bell muted for this order. Tap the muted icon to ring again.' : 'Notifications will continue until this order is accepted or moved out of pending.'}</Text>
           <Primary label="Open order" onPress={onOpen} />
           <Secondary label="Later" onPress={onClose} />
         </View>
@@ -3674,6 +3735,9 @@ const s = StyleSheet.create({
   modalShade: { flex: 1, backgroundColor: 'rgba(0,0,0,0.36)', justifyContent: 'center', padding: 22 },
   modalCard: { backgroundColor: C.bg, borderRadius: 22, padding: 20, gap: 12 },
   newOrderModal: { backgroundColor: C.bg, borderRadius: 24, padding: 22, gap: 12, alignItems: 'center' },
+  popupBellButton: { alignItems: 'center', justifyContent: 'center', paddingVertical: 4, gap: 2 },
+  popupBell: { fontSize: 36, lineHeight: 42 },
+  popupBellHint: { color: C.muted, fontSize: 11, fontWeight: '700' },
   newOrderTitle: { color: C.orange, fontSize: 18, fontWeight: '900', marginTop: 4 },
   newOrderNo: { color: C.ink, fontSize: 24, fontWeight: '900' },
   newOrderBody: { color: C.ink, fontSize: 16, fontWeight: '800' },
