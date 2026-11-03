@@ -1,0 +1,67 @@
+{
+  "project_info": {
+    "project_number": "930149117217",
+    "project_id": "zepmed-ac012",
+    "storage_bucket": "zepmed-ac012.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:930149117217:android:01a5d2302695165c8ba260",
+        "android_client_info": {
+          "package_name": "com.zepmed.customer"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBiIMtJ8_F6Krb6-vaWw5L3KTR60Ar0DMw"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:930149117217:android:e0b7c1d872573d358ba260",
+        "android_client_info": {
+          "package_name": "com.zepmed.doctor.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBiIMtJ8_F6Krb6-vaWw5L3KTR60Ar0DMw"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:930149117217:android:96015c5254a15c338ba260",
+        "android_client_info": {
+          "package_name": "com.zepmed.seller"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBiIMtJ8_F6Krb6-vaWw5L3KTR60Ar0DMw"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -2,9 +2,22 @@
   "expo": {
     "name": "ZepMed Seller",
     "slug": "zepmed-seller",
-    "version": "1.0.2",
+    "version": "1.0.3",
     "plugins": [
-      "./plugins/withZepMedPrinter.js"
+      "./plugins/withZepMedPrinter.js",
+      "./plugins/withSellerFcm.js",
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/ic_launcher.png",
+          "color": "#E2632E",
+          "sounds": [
+            "./assets/order_bell.mp3",
+            "./assets/bell.mp3"
+          ],
+          "defaultChannel": "zepmed-seller-orders"
+        }
+      ]
     ],
     "orientation": "portrait",
     "icon": "./assets/ic_launcher.png",
@@ -30,7 +43,8 @@
     },
     "android": {
       "package": "com.zepmed.seller",
-      "versionCode": 3,
+      "googleServicesFile": "./google-services.json",
+      "versionCode": 4,
       "adaptiveIcon": {
         "foregroundImage": "./assets/ic_launcher.png",
         "backgroundColor": "#0F766E"

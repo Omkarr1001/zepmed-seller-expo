@@ -13,6 +13,8 @@ import { listPairedPrinters, readSellerPrefs, writeSellerPrefs, type PairedPrint
 import { setOrderWatchSound, silenceNativeOrder, startOrderWatch, stopOrderWatch } from './orderWatch';
 import { formatForwardPharmacy, nearbyRetailOnly } from './nearbyForward';
 import { hydrateMutedOrderIds, isOrderMuted, muteOrder, subscribeMutedOrders, unmuteOrder } from './mutedOrders';
+import { hasCustomerRxDetails, parseCustomerRxDetails, type CustomerRxSource } from './customerRxDetails';
+import { orderIdFromNotificationData, registerSellerPush, SELLER_FCM_CHANNEL, SELLER_FCM_SOUND } from './sellerPush';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -82,7 +84,7 @@ const PENDING_NOTIFICATIONS_KEY = 'zepmed:seller:pending-notifications-v4';
 const NOTIF_RESET_KEY = 'zepmed:seller:notif-reset-v4';
 const ORDER_POLL_TASK = 'zepmed-seller-order-poll';
 const ORDER_NOTIFICATION_CATEGORY = 'zepmed-seller-order-actions';
-const ORDER_CHANNEL = 'zepmed-order-bell-v4';
+const ORDER_CHANNEL = SELLER_FCM_CHANNEL;
 const silencedOrderIds = new Set<number>();
 /** Prevent double Ready POSTs — each ready_for_pickup clears delivery_agent_id and re-offers. */
 const readyInFlight = new Set<number>();
@@ -179,6 +181,15 @@ type Order = {
   shop_order_discount?: number | null;
   virtual_shop_label?: string | null;
   routing_notes?: string | null;
+  notes?: string | null;
+  customer_notes?: string | null;
+  extra_details?: string | null;
+  extra_rx_details?: string | null;
+  requested_supply?: string | null;
+  doses?: string | null;
+  dosage?: string | null;
+  other_notes?: string | null;
+  other_instructions?: string | null;
 };
 type OrderLineItem = {
   id: number;
@@ -297,7 +308,23 @@ type SellerNotification = {
   meta?: { action?: string | null; status?: string | null; approval_status?: string | null; product_id?: number | null; [key: string]: unknown } | null;
 };
 type NotifFilter = 'all' | 'approved' | 'rejected';
-type RxRequest = { id: number; customer_name?: string | null; customer_phone?: string | null; status?: string | null; prescription_url?: string | null; created_at?: string | null; notes?: string | null; request_number?: string | null; message?: string | null };
+type RxRequest = {
+  id: number;
+  customer_name?: string | null;
+  customer_phone?: string | null;
+  status?: string | null;
+  prescription_url?: string | null;
+  created_at?: string | null;
+  notes?: string | null;
+  seller_notes?: string | null;
+  request_number?: string | null;
+  message?: string | null;
+  extra_details?: string | null;
+  extra_rx_details?: string | null;
+  requested_supply?: string | null;
+  doses?: string | null;
+  other_notes?: string | null;
+};
 type DiscountRule = {
   id: number;
   name?: string | null;
@@ -600,6 +627,7 @@ async function persistAuth(data: AuthSession) {
   });
   const prefs = await readPrefs();
   startOrderWatch(data.access_token, data.refresh_token || current.refreshToken, prefs.sound);
+  void registerSellerFcm();
 }
 
 async function refreshAccessToken() {
@@ -728,10 +756,22 @@ async function ensureNotificationReady() {
       await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS).catch(() => undefined);
     }
     await Notifications.setNotificationChannelAsync(ORDER_CHANNEL, {
-      name: 'ZepMed new orders',
+      name: 'ZepMed seller orders',
       importance: Notifications.AndroidImportance.MAX,
       vibrationPattern: [0, 400, 150, 400, 150, 500],
-      sound: 'bell',
+      sound: SELLER_FCM_SOUND,
+      enableVibrate: true,
+      enableLights: true,
+      lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
+      bypassDnd: true,
+      showBadge: true,
+    });
+    // Keep the older local channel so upgrades still ring if a leftover schedule exists.
+    await Notifications.setNotificationChannelAsync('zepmed-order-bell-v4', {
+      name: 'ZepMed new orders (legacy)',
+      importance: Notifications.AndroidImportance.MAX,
+      vibrationPattern: [0, 400, 150, 400, 150, 500],
+      sound: SELLER_FCM_SOUND,
       enableVibrate: true,
       enableLights: true,
       lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
@@ -755,7 +795,7 @@ function orderNotificationContent(order: Order) {
   return {
     title: `New order ${order.order_number || ''}`.trim(),
     body: `${order.customer_name || 'Customer'} • ${money(order.total_amount)}. Tap to open and accept.`,
-    sound: 'bell',
+    sound: SELLER_FCM_SOUND,
     data: { orderId: order.id },
     categoryIdentifier: ORDER_NOTIFICATION_CATEGORY,
     sticky: true,
@@ -1002,7 +1042,20 @@ const sellerApi = {
   subscriptionPlans: () => request<{ items?: SellerPlan[] | null }>('seller/subscription/plans'),
   subscriptionPreview: (planId: number) => request<SubscriptionPreview>('seller/subscription/preview', { query: { plan_id: planId, use_wallet: 1 } }),
   subscribePlan: (planId: number) => request<SubscriptionInfo>('seller/subscription/subscribe', { body: { plan_id: planId, payment_method: 'demo', demo_card: '4242 4242 4242 4242', simulate: 'success', use_wallet: 1 } }),
+  deviceToken: (body: { fcm_token: string; token: string; platform: string; device_type: string; device_name: string }) =>
+    request<{ saved?: number | null; platform?: string | null }>('seller/device-token', { body }),
 };
+
+async function registerSellerFcm() {
+  try {
+    await registerSellerPush({
+      ensureReady: ensureNotificationReady,
+      postDeviceToken: (body) => sellerApi.deviceToken(body),
+    });
+  } catch {
+    // Emulators without Play Services cannot mint a native FCM token.
+  }
+}
 
 async function ensureNearbyForward(order: OrderDetail): Promise<OrderDetail> {
   let list = nearbyRetailOnly(order.forward_pharmacies);
@@ -1331,8 +1384,10 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
       startOrderWatch(session.accessToken, session.refreshToken, prefs.sound);
     }).catch(() => undefined);
     registerOrderBackgroundTask().catch(() => undefined);
+    void registerSellerFcm();
     const sub = Notifications.addNotificationResponseReceivedListener((response) => {
-      const orderId = Number(response.notification.request.content.data?.orderId || 0);
+      const data = (response.notification.request.content.data || {}) as Record<string, unknown>;
+      const orderId = orderIdFromNotificationData(data) || Number(data.orderId || 0);
       const actionId = response.actionIdentifier;
       if (orderId && actionId === 'accept') {
         const order = orders.find((item) => item.id === orderId);
@@ -1341,6 +1396,12 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
       } else if (orderId) {
         openOrder(orderId);
       }
+    });
+    const received = Notifications.addNotificationReceivedListener((notification) => {
+      const data = (notification.request.content.data || {}) as Record<string, unknown>;
+      const orderId = orderIdFromNotificationData(data);
+      void refresh(true, true);
+      if (orderId && !isOrderMuted(orderId)) void startOrderBell(true);
     });
     const appSub = AppState.addEventListener('change', (state) => {
       if (state === 'active') {
@@ -1352,6 +1413,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
     });
     return () => {
       sub.remove();
+      received.remove();
       appSub.remove();
     };
   }, [orders, refresh]);
@@ -2252,6 +2314,7 @@ function RxRequestsScreen() {
   if (selected) return <>
     <TouchableOpacity onPress={() => setSelected(null)}><Text style={s.backText}>‹ Requests</Text></TouchableOpacity>
     <View style={s.card}><Text style={s.itemTitle}>{selected.customer_name || 'Customer'} Rx</Text><Text style={s.muted}>{selected.status || '-'} • {prettyDate(selected.created_at)}</Text>{selected.prescription_url ? <Image source={{ uri: mediaUrl(selected.prescription_url) }} style={s.rxImage} resizeMode="contain" /> : null}</View>
+    <CustomerRxDetailsCard source={selected} />
     <Field label="Message / seller notes" value={note} onChangeText={setNote} multiline />
     <SearchBox placeholder="Search medicine from catalog" value={search} onChangeText={searchCatalog} />
     {results.slice(0, 6).map((p) => {
@@ -2265,14 +2328,14 @@ function RxRequestsScreen() {
   return <>
     {loading ? <CenteredLoader compact /> : null}
     {error ? <Notice tone="error" title="Could not load Rx requests" body={error} /> : null}
-    {items.map((rx) => <MenuItem key={rx.id} title={rx.customer_name || `Rx #${rx.id}`} body={`${rx.status || 'pending'} • ${prettyDate(rx.created_at)}`} badge={rx.status || undefined} onPress={async () => {
+    {items.map((rx) => <MenuItem key={rx.id} title={rx.customer_name || `Rx #${rx.id}`} body={`${rx.status || 'pending'} • ${prettyDate(rx.created_at)}${hasCustomerRxDetails(rx) ? ` • ${parseCustomerRxDetails(rx).map((line) => `${line.label}: ${line.value}`).join(' · ')}` : ''}`} badge={rx.status || undefined} onPress={async () => {
       setSelected(rx);
-      setNote(rx.notes || '');
+      setNote(rx.seller_notes || '');
       try {
         const detail = await sellerApi.rxRequestDetail(rx.id);
         if (detail.data) {
           setSelected(detail.data);
-          setNote(detail.data.notes || detail.data.message || '');
+          setNote(detail.data.seller_notes || '');
         }
       } catch { /* list row is enough to continue */ }
     }} />)}
@@ -2518,7 +2581,6 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
   const [rxRows, setRxRows] = useState<RxMedicineRow[]>([{ name: '', qty: '1', price: '' }]);
   const [rxSuggest, setRxSuggest] = useState<Record<number, CatalogSuggestion[]>>({});
   const [rxImageOpen, setRxImageOpen] = useState(false);
-  const [forward, setForward] = useState<Record<number, { qty: string; pharmacyId: string }>>({});
   const [invoice, setInvoice] = useState<OrderDetail['invoice']>(order.invoice ?? null);
   const [showInvoice, setShowInvoice] = useState(false);
 
@@ -2609,8 +2671,6 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
       items: (detail.items ?? []).map((item) => ({
         order_item_id: item.id,
         fulfill_qty: Number(fulfill[item.id] || 0),
-        forward_qty: Number(forward[item.id]?.qty || 0),
-        forward_to_pharmacy_id: Number(forward[item.id]?.pharmacyId || 0),
       })),
     };
   }
@@ -2720,7 +2780,6 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
   const pending = pendingStatus(detail.status);
   const rx = detail.is_prescription_order || isPrescription(detail);
   const nearbyForward = nearbyRetailOnly(detail.forward_pharmacies);
-  const firstNearbyId = String(nearbyForward[0]?.id || '');
   return (
     <View style={[s.screen, { paddingTop: insets.top }]}>
       <Header title={rx ? 'Prescription Order' : detail.order_number} subtitle={detail.status.replace(/_/g, ' ')} onRefresh={reload} onLogout={onBack} />
@@ -2734,6 +2793,7 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
             <Text style={s.muted}>{[detail.address_line, detail.city, detail.pincode].filter(Boolean).join(', ')}</Text>
             <View style={s.rowBetween}><Text style={s.amount}>Total {money(detail.total_amount)}</Text>{detail.payment_method ? <Pill text={detail.payment_method.toUpperCase()} tone="blue" /> : null}</View>
           </View>
+          <CustomerRxDetailsCard source={detail} />
         {rx && mediaUrl(detail.prescription_url) ? (
           <TouchableOpacity activeOpacity={0.9} onPress={() => setRxImageOpen(true)}>
             <Image source={{ uri: mediaUrl(detail.prescription_url) }} style={s.rxImage} resizeMode="contain" />
@@ -2776,17 +2836,6 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
               <Text style={s.itemTitle}>{item.product_name || 'Item'}</Text>
               <Text style={s.muted}>Ordered {item.quantity ?? 0} • {item.catalog_note || 'New on confirm'} • {money(item.price)}</Text>
               {pending && !rx ? <Field label="Fulfill" value={fulfill[item.id] || '0'} onChangeText={(v) => setFulfill((m) => ({ ...m, [item.id]: v.replace(/\D/g, '') }))} keyboardType="number-pad" compact /> : null}
-              {pending && !rx && (nearbyForward.length || dash?.pharmacy) ? (
-                <View style={s.inputRow}>
-                  <Field label="Forward qty" value={forward[item.id]?.qty || ''} onChangeText={(v) => setForward((m) => ({ ...m, [item.id]: { qty: v.replace(/\D/g, ''), pharmacyId: m[item.id]?.pharmacyId || firstNearbyId } }))} compact />
-                  <Field
-                    label="Forward pharmacy id"
-                    value={forward[item.id]?.pharmacyId || firstNearbyId}
-                    onChangeText={(v) => setForward((m) => ({ ...m, [item.id]: { qty: m[item.id]?.qty || '', pharmacyId: v.replace(/\D/g, '') } }))}
-                    compact
-                  />
-                </View>
-              ) : null}
             </View>
           ))
         )}
@@ -3056,6 +3105,11 @@ function OrderCard({ order, onOpen, onAction }: { order: Order; onOpen: () => vo
         <View style={[s.pill, { backgroundColor: tone.bg, minWidth: 120 }]}><Text style={[s.pillText, { color: tone.fg }]}>{tone.label}</Text></View>
       </View>
       {isPrescription(order) ? <Text style={s.rxBadge}>Prescription order</Text> : null}
+      {hasCustomerRxDetails(order) ? (
+        <Text style={s.rxExtrasPreview} numberOfLines={3}>
+          {parseCustomerRxDetails(order).map((line) => `${line.label}: ${line.value}`).join(' · ')}
+        </Text>
+      ) : null}
       {isVirtualShop(order) ? <VirtualShopBanner order={order} compact /> : null}
       <View style={s.rowBetween}>
         <View style={{ flex: 1 }}>
@@ -3139,6 +3193,11 @@ function NewOrderPopup({ order, onOpen, onClose }: { order: Order | null; onOpen
           <Text style={s.newOrderTitle}>New order received!</Text>
           <Text style={s.newOrderNo}>{order?.order_number}</Text>
           <Text style={s.newOrderBody}>{order?.customer_name || 'Customer'} • {money(order?.total_amount)}</Text>
+          {order && hasCustomerRxDetails(order) ? (
+            <Text style={s.rxExtrasPreview}>
+              {parseCustomerRxDetails(order).map((line) => `${line.label}: ${line.value}`).join('\n')}
+            </Text>
+          ) : null}
           <Text style={s.newOrderHint}>{muted ? 'Bell muted for this order. Tap the muted icon to ring again.' : 'Notifications will continue until this order is accepted or moved out of pending.'}</Text>
           <Primary label="Open order" onPress={onOpen} />
           <Secondary label="Later" onPress={onClose} />
@@ -3531,6 +3590,18 @@ function Info({ label, value }: { label: string; value: string }) {
   return <View style={{ marginBottom: 10 }}><Text style={s.kpiLabel}>{label}</Text><Text style={s.infoValue}>{value}</Text></View>;
 }
 
+function CustomerRxDetailsCard({ source }: { source: CustomerRxSource }) {
+  const lines = parseCustomerRxDetails(source);
+  if (!lines.length) return null;
+  return (
+    <View style={s.extrasCard}>
+      <Text style={s.itemTitle}>Customer extra Rx details</Text>
+      <Text style={s.muted}>Qty, doses and other notes sent with the prescription.</Text>
+      {lines.map((line, idx) => <Info key={`${line.label}-${idx}`} label={line.label} value={line.value} />)}
+    </View>
+  );
+}
+
 function MenuItem({ title, body, badge, onPress }: { title: string; body: string; badge?: string; onPress: () => void }) {
   return <TouchableOpacity style={s.menuItem} onPress={onPress}><View style={{ flex: 1 }}><Text style={s.itemTitle}>{title}</Text><Text style={s.muted}>{body}</Text></View>{badge ? <Pill text={badge} tone="green" /> : null}<Text style={s.chev}>›</Text></TouchableOpacity>;
 }
@@ -3715,6 +3786,8 @@ const s = StyleSheet.create({
   imageClose: { position: 'absolute', top: 44, right: 18, zIndex: 2, minHeight: 42, borderRadius: 22, backgroundColor: 'rgba(255,255,255,0.92)', paddingHorizontal: 18, alignItems: 'center', justifyContent: 'center' },
   imageCloseText: { color: C.ink, fontWeight: '900' },
   fullRxImage: { width: '100%', height: '100%' },
+  extrasCard: { backgroundColor: '#FFF7ED', borderRadius: 16, borderWidth: 1, borderColor: '#F3D6B8', padding: 14, gap: 4 },
+  rxExtrasPreview: { color: C.orangeDark, fontSize: 12, fontWeight: '700', lineHeight: 17, marginTop: 6 },
   virtualBanner: { backgroundColor: '#FFF7ED', borderRadius: 14, padding: 12 },
   virtualTitle: { color: C.orangeDark, fontWeight: '900', fontSize: 13 },
   virtualText: { color: C.yellow, fontSize: 12, marginTop: 4 },
