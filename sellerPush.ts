@@ -65,6 +65,15 @@ export function isPrescriptionNotification(data?: Record<string, unknown> | null
     || data.rx === '1';
 }
 
+function positivePushAmount(...values: unknown[]): number {
+  for (const value of values) {
+    if (value == null || value === '') continue;
+    const n = typeof value === 'number' ? value : Number(String(value).replace(/,/g, ''));
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return 0;
+}
+
 /** Immediate list/detail seed so a notification tap does not wait on seller/orders. */
 export function orderStubFromNotificationData(data?: Record<string, unknown> | null): {
   id: number;
@@ -78,19 +87,30 @@ export function orderStubFromNotificationData(data?: Record<string, unknown> | n
   payment_method: string | null;
   created_at: string;
 } | null {
+  if (!data) return null;
   const id = orderIdFromNotificationData(data);
   if (!id) return null;
   const rx = isPrescriptionNotification(data);
+  const customer = String(data.customer_name || data.customerName || data.customer || '').trim();
   return {
     id,
-    order_number: String(data?.order_number || data?.orderNumber || `Order #${id}`),
-    status: String(data?.status || data?.order_status || (rx ? 'prescription_review' : 'placed')),
-    total_amount: Number(data?.total_amount ?? data?.total ?? 0) || 0,
-    customer_name: data?.customer_name ? String(data.customer_name) : null,
-    notes: data?.notes ? String(data.notes) : null,
-    order_type: rx ? 'prescription' : (data?.order_type ? String(data.order_type) : null),
+    order_number: String(data.order_number || data.orderNumber || `Order #${id}`),
+    status: String(data.status || data.order_status || (rx ? 'prescription_review' : 'placed')),
+    total_amount: positivePushAmount(
+      data.total_amount,
+      data.totalAmount,
+      data.customer_payable,
+      data.cod_collect_amount,
+      data.grand_total,
+      data.bill_total,
+      data.amount,
+      data.total,
+    ),
+    customer_name: customer && customer.toLowerCase() !== 'customer' ? customer : (customer || null),
+    notes: data.notes ? String(data.notes) : null,
+    order_type: rx ? 'prescription' : (data.order_type ? String(data.order_type) : null),
     is_prescription_order: rx,
-    payment_method: data?.payment_method ? String(data.payment_method) : null,
-    created_at: String(data?.created_at || new Date().toISOString()),
+    payment_method: data.payment_method ? String(data.payment_method) : null,
+    created_at: String(data.created_at || new Date().toISOString()),
   };
 }

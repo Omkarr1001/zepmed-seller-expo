@@ -13,6 +13,7 @@ import { listPairedPrinters, readSellerPrefs, writeSellerPrefs, type PairedPrint
 import { setOrderWatchSound, silenceNativeOrder, startOrderWatch, stopOrderWatch } from './orderWatch';
 import { hydrateMutedOrderIds, isOrderMuted, muteOrder, subscribeMutedOrders, unmuteOrder } from './mutedOrders';
 import { hasCustomerRxDetails, parseCustomerRxDetails, type CustomerRxSource } from './customerRxDetails';
+import { mergeIncomingOrder, orderBillAmount, orderCustomerName, popupDecisionActions } from './orderPopup';
 import { orderIdFromNotificationData, orderStubFromNotificationData, registerSellerPush, SELLER_FCM_CHANNEL, SELLER_FCM_SOUND } from './sellerPush';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -172,6 +173,13 @@ type Order = {
   order_number: string;
   status: string;
   total_amount: number;
+  customer_payable?: number | null;
+  cod_collect_amount?: number | null;
+  grand_total?: number | null;
+  bill_total?: number | null;
+  amount?: number | null;
+  subtotal?: number | null;
+  seller_payout_amount?: number | null;
   customer_name?: string | null;
   address_line?: string | null;
   city?: string | null;
@@ -583,24 +591,7 @@ function decisionActionMessage(code: string) {
 }
 
 function orderDecisionActions(order: Order) {
-  if (!pendingStatus(order.status)) return [] as Array<{ code: string; label: string }>;
-  if (isPrescription(order)) {
-    if (hasSellerConfirmedAt(order.seller_confirmed_at)) {
-      return [
-        { code: 'rejected', label: 'Reject' },
-        { code: 'wrong_prescription', label: 'Wrong prescription' },
-      ];
-    }
-    return [
-      { code: 'rx_accept', label: 'Accept' },
-      { code: 'rejected', label: 'Reject' },
-      { code: 'wrong_prescription', label: 'Wrong prescription' },
-    ];
-  }
-  return [
-    { code: 'confirmed', label: 'Accept' },
-    { code: 'rejected', label: 'Reject' },
-  ];
+  return popupDecisionActions(order);
 }
 
 /** Live panel marks ready via POST seller/orders/action (triggers exclusive delivery offer). */
@@ -891,7 +882,7 @@ async function ensureNotificationReady() {
 function orderNotificationContent(order: Order) {
   return {
     title: `New order ${order.order_number || ''}`.trim(),
-    body: `${order.customer_name || 'Customer'} • ${money(order.total_amount)}. Tap to open and accept.`,
+    body: `${orderCustomerName(order.customer_name) || 'Customer'} • ${money(orderBillAmount(order) || order.total_amount)}. Tap to open and accept.`,
     sound: SELLER_FCM_SOUND,
     data: { orderId: order.id },
     categoryIdentifier: ORDER_NOTIFICATION_CATEGORY,
@@ -1400,13 +1391,16 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
   ordersRef.current = orders;
 
   function rememberIncomingOrder(order: Order) {
-    localOrderStubs.current.set(order.id, order);
-    knownOrders.current.add(order.id);
+    const prev = localOrderStubs.current.get(order.id) || ordersRef.current.find((item) => item.id === order.id);
+    const merged = mergeIncomingOrder(prev, order);
+    localOrderStubs.current.set(merged.id, merged);
+    knownOrders.current.add(merged.id);
     setOrders((list) => (
-      list.some((item) => item.id === order.id)
-        ? list.map((item) => item.id === order.id ? { ...item, ...order } : item)
-        : [order, ...list]
+      list.some((item) => item.id === merged.id)
+        ? list.map((item) => item.id === merged.id ? mergeIncomingOrder(item, merged) : item)
+        : [merged, ...list]
     ));
+    return merged;
   }
 
   const refreshNotifUnread = useCallback(async () => {
@@ -1447,11 +1441,20 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
         const firstFresh = next.find((order) => !knownOrders.current.has(order.id) && orderCanShowNewPopup(order));
         const sessionAlreadyHydrated = knownOrders.current.size > 0;
         if (firstFresh && (sessionAlreadyHydrated || orderIsRecent(firstFresh))) {
-          setFresh(firstFresh);
-          setPopupOutcome(null);
+          if (!knownOrders.current.has(firstFresh.id)) setPopupOutcome(null);
           if (!isOrderMuted(firstFresh.id)) void startOrderBell(true);
           else void stopOrderBell();
         }
+        setFresh((current) => {
+          let nextFresh = current;
+          if (firstFresh && (sessionAlreadyHydrated || orderIsRecent(firstFresh))) {
+            if (!current) nextFresh = firstFresh;
+            else if (current.id === firstFresh.id) nextFresh = mergeIncomingOrder(current, firstFresh);
+          }
+          if (!nextFresh) return nextFresh;
+          const full = next.find((order) => order.id === nextFresh.id);
+          return full ? mergeIncomingOrder(nextFresh, full) : nextFresh;
+        });
         knownOrders.current = new Set(next.map((order) => order.id));
         setOrders(next);
         await syncPendingOrderNotifications(next);
@@ -1527,14 +1530,16 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
       const actionId = response.actionIdentifier;
       const stub = orderStubFromNotificationData(data);
       const existing = ordersRef.current.find((item) => item.id === orderId);
-      const incoming = stub ? { ...(existing || {}), ...stub } as Order : existing;
-      if (incoming) rememberIncomingOrder(incoming);
+      const incoming = stub ? mergeIncomingOrder(existing, stub as Order) : existing;
+      const remembered = incoming ? rememberIncomingOrder(incoming) : incoming;
       if (orderId && actionId === 'accept') {
         const code = incoming && isPrescription(incoming) ? 'rx_accept' : 'confirmed';
-        action(orderId, code).catch(() => openOrder(orderId, incoming));
+        action(orderId, code).catch(() => openOrder(orderId, remembered));
       } else if (orderId) {
-        if (incoming && orderCanShowNewPopup(incoming)) setFresh(incoming);
-        openOrder(orderId, incoming);
+        if (remembered && orderCanShowNewPopup(remembered)) {
+          setFresh((current) => current?.id === remembered.id ? mergeIncomingOrder(current, remembered) : remembered);
+        }
+        openOrder(orderId, remembered);
       }
       void refresh(true, true);
     });
@@ -1542,10 +1547,12 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
       const data = (notification.request.content.data || {}) as Record<string, unknown>;
       const stub = orderStubFromNotificationData(data);
       const existing = stub ? ordersRef.current.find((item) => item.id === stub.id) : undefined;
-      const incoming = stub ? { ...(existing || {}), ...stub } as Order : existing;
+      const incoming = stub ? mergeIncomingOrder(existing, stub as Order) : existing;
       if (incoming) {
-        rememberIncomingOrder(incoming);
-        if (orderCanShowNewPopup(incoming)) setFresh(incoming);
+        const remembered = rememberIncomingOrder(incoming);
+        if (orderCanShowNewPopup(remembered)) {
+          setFresh((current) => current?.id === remembered.id ? mergeIncomingOrder(current, remembered) : remembered);
+        }
       }
       if (incoming && !isOrderMuted(incoming.id)) void startOrderBell(true);
       else if (stub && !isOrderMuted(stub.id)) void startOrderBell(true);
@@ -1569,6 +1576,17 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
       muteSub();
     };
   }, [refresh]);
+
+  useEffect(() => {
+    if (!fresh) return;
+    if (orderBillAmount(fresh) > 0 && orderCustomerName(fresh.customer_name)) return;
+    let cancelled = false;
+    sellerApi.orderDetail(fresh.id).then((res) => {
+      if (cancelled || !res.data) return;
+      setFresh((current) => current?.id === res.data!.id ? mergeIncomingOrder(current, res.data as Order) : current);
+    }).catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [fresh?.id]);
 
   useEffect(() => {
     const sub = BackHandler.addEventListener('hardwareBackPress', () => {
@@ -1771,7 +1789,6 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode="on-drag"
       >
-        {fresh ? <FreshBanner order={fresh} onOpen={() => openOrder(fresh.id)} onClose={() => setFresh(null)} /> : null}
         {error ? <Notice tone="error" title={error} /> : null}
         {tab === 'home' ? <HomeScreen dash={dash} orders={orders} onOpenOrder={openOrder} onAction={action} onDashboardTarget={openDashboardTarget} onStoreToggle={toggleStoreOpen} /> : null}
         {tab === 'orders' ? <OrdersScreen orders={orders} filter={orderFilter} onFilter={setOrderFilter} onOpenOrder={openOrder} onAction={action} /> : null}
@@ -3441,7 +3458,7 @@ function OrderCard({ order, onOpen, onAction }: { order: Order; onOpen: () => vo
           <Text style={s.customer}>{order.customer_name || 'Customer'}</Text>
           <Text style={s.muted}>{[order.address_line, order.city].filter(Boolean).join(', ')}</Text>
         </View>
-        <Text style={s.orderAmount}>{money(order.total_amount)}</Text>
+        <Text style={s.orderAmount}>{money(orderBillAmount(order) || order.total_amount)}</Text>
       </View>
       <View style={s.actionRow}>
         {order.payment_method ? <Pill text={order.payment_method.toUpperCase()} /> : null}
@@ -3528,8 +3545,10 @@ function NewOrderPopup({
   onClose: () => void;
   onAction: (code: string) => void;
 }) {
-  const decisions = order && !outcome ? orderDecisionActions(order) : [];
+  const decisions = order && !outcome ? popupDecisionActions(order) : [];
   const rxLines = order ? parseCustomerRxDetails(order) : [];
+  const bill = orderBillAmount(order);
+  const who = orderCustomerName(order?.customer_name) || 'Customer';
   return (
     <Modal visible={Boolean(order)} transparent animationType="fade" onRequestClose={onClose}>
       <View style={s.modalShade}>
@@ -3540,7 +3559,7 @@ function NewOrderPopup({
             {outcome === 'accepted' ? 'Order accepted' : outcome === 'rejected' ? 'Order rejected' : 'New order received!'}
           </Text>
           <Text style={[s.newOrderNo, { textAlign: 'center' }]}>{order?.order_number}</Text>
-          <Text style={[s.newOrderBody, { textAlign: 'center' }]}>{order?.customer_name || 'Customer'} • {money(order?.total_amount)}</Text>
+          <Text style={[s.newOrderBody, { textAlign: 'center' }]}>{who} • {bill ? money(bill) : 'Bill loading…'}</Text>
           {order && isPrescription(order) ? <Text style={[s.rxBadge, { textAlign: 'center' }]}>Prescription order</Text> : null}
           {rxLines.length ? (
             <View style={s.extrasCard}>
@@ -4171,7 +4190,7 @@ const s = StyleSheet.create({
   tabLabel: { color: C.muted, fontSize: 11, fontWeight: '800', marginTop: 3 },
   tabTextActive: { color: C.teal },
   badge: { position: 'absolute', right: -8, top: -6, minWidth: 18, height: 18, borderRadius: 9, backgroundColor: C.redAccent, color: '#FFF', fontWeight: '900', textAlign: 'center', overflow: 'hidden', fontSize: 10, lineHeight: 18 },
-  modalShade: { flex: 1, backgroundColor: 'rgba(0,0,0,0.36)', justifyContent: 'center', paddingHorizontal: 18, paddingVertical: 36 },
+  modalShade: { flex: 1, backgroundColor: 'rgba(18,49,47,0.82)', justifyContent: 'center', paddingHorizontal: 18, paddingVertical: 36 },
   modalCard: { backgroundColor: C.bg, borderRadius: 22, padding: 20, gap: 12 },
   newOrderModal: { backgroundColor: C.bg, borderRadius: 24, padding: 22, gap: 12, alignItems: 'center', maxHeight: '90%', width: '100%' },
   popupBellButton: { alignItems: 'center', justifyContent: 'center', paddingVertical: 4, gap: 2 },
