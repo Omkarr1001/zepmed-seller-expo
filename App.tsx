@@ -11,7 +11,6 @@ import { csvFromRows, printBill, shareBillPdf, type PrinterLayout } from './prin
 import { prepareOrderBell, startOrderBell, stopOrderBell } from './orderBell';
 import { listPairedPrinters, readSellerPrefs, writeSellerPrefs, type PairedPrinter } from './printerNative';
 import { setOrderWatchSound, silenceNativeOrder, startOrderWatch, stopOrderWatch } from './orderWatch';
-import { formatForwardPharmacy, nearbyRetailOnly } from './nearbyForward';
 import { hydrateMutedOrderIds, isOrderMuted, muteOrder, subscribeMutedOrders, unmuteOrder } from './mutedOrders';
 import { hasCustomerRxDetails, parseCustomerRxDetails, type CustomerRxSource } from './customerRxDetails';
 import { orderIdFromNotificationData, registerSellerPush, SELLER_FCM_CHANNEL, SELLER_FCM_SOUND } from './sellerPush';
@@ -170,6 +169,7 @@ type Order = {
   accept_deadline_at?: string | null;
   fulfillment_status?: string | null;
   order_type?: string | null;
+  is_prescription_order?: boolean | null;
   routed_via?: string | null;
   seller_confirmed_at?: string | null;
   forwarded_to_me?: boolean | number | null;
@@ -473,17 +473,28 @@ function pendingStatus(status?: string | null) {
   return ['placed', 'new', 'pending', 'prescription_review'].includes((status ?? '').toLowerCase());
 }
 
+function isRxPending(order: Pick<Order, 'order_type' | 'status'> & { is_prescription_order?: boolean | null }) {
+  const rx = order.order_type === 'prescription'
+    || order.is_prescription_order === true
+    || (order.status ?? '').toLowerCase() === 'prescription_review';
+  return rx && pendingStatus(order.status);
+}
+
 function orderCanShowNewPopup(order: Order) {
   if (silencedOrderIds.has(order.id)) return false;
   if (!pendingStatus(order.status)) return false;
-  if (order.seller_confirmed_at) return false;
   if (order.forwarded_to_me) return false;
   if (order.viewer_is_owner === false) return false;
-  if (order.accept_seconds_remaining != null) return Number(order.accept_seconds_remaining) > 0;
-  if (order.accept_deadline_at) {
-    const normalized = order.accept_deadline_at.includes('T') ? order.accept_deadline_at : order.accept_deadline_at.replace(' ', 'T');
-    const deadline = new Date(normalized).getTime();
-    if (!Number.isNaN(deadline)) return deadline > Date.now();
+  // Rx stays in prescription_review until fill. seller_confirmed_at / accept
+  // timeout may be set by rx_accept or a DB default — still ring + popup.
+  if (!isRxPending(order)) {
+    if (order.seller_confirmed_at) return false;
+    if (order.accept_seconds_remaining != null) return Number(order.accept_seconds_remaining) > 0;
+    if (order.accept_deadline_at) {
+      const normalized = order.accept_deadline_at.includes('T') ? order.accept_deadline_at : order.accept_deadline_at.replace(' ', 'T');
+      const deadline = new Date(normalized).getTime();
+      if (!Number.isNaN(deadline)) return deadline > Date.now();
+    }
   }
   return true;
 }
@@ -495,12 +506,29 @@ function silenceOrderAlert(orderId: number) {
 function forgetSettledSilenced(orders: Order[]) {
   for (const id of [...silencedOrderIds]) {
     const order = orders.find((item) => item.id === id);
-    if (!order || !pendingStatus(order.status) || order.seller_confirmed_at) silencedOrderIds.delete(id);
+    if (!order || !pendingStatus(order.status) || (!isRxPending(order) && order.seller_confirmed_at)) silencedOrderIds.delete(id);
   }
 }
 
 function withNearbyForward(order: OrderDetail): OrderDetail {
-  return { ...order, forward_pharmacies: nearbyRetailOnly(order.forward_pharmacies) };
+  return order;
+}
+
+function rxSelectionLineNumbers(notes?: string | null): number[] {
+  const match = String(notes || '').match(/\[RX_SELECTIONS\]([\s\S]*?)\[\/RX_SELECTIONS\]/);
+  if (!match) return [];
+  try {
+    const lines = JSON.parse(match[1]) as Array<{ mode?: string; line_number?: number }>;
+    return (lines || []).filter((line) => (line.mode || '') !== 'skip').map((line) => Number(line.line_number)).filter((n) => n > 0);
+  } catch {
+    return [];
+  }
+}
+
+function orderIsRecent(order: Order, maxAgeMs = 2 * 60 * 60 * 1000) {
+  const created = Date.parse(String(order.created_at || '').replace(' ', 'T'));
+  if (!Number.isFinite(created) || created <= 0) return true;
+  return Date.now() - created <= maxAgeMs;
 }
 
 function orderStatusKey(status?: string | null) {
@@ -1058,16 +1086,7 @@ async function registerSellerFcm() {
 }
 
 async function ensureNearbyForward(order: OrderDetail): Promise<OrderDetail> {
-  let list = nearbyRetailOnly(order.forward_pharmacies);
-  if (!list.length) {
-    try {
-      const fwd = await sellerApi.forwardPharmacies(order.pincode || undefined);
-      list = nearbyRetailOnly(fwd.data?.items);
-    } catch {
-      // Order can still be processed without a forward list.
-    }
-  }
-  return { ...order, forward_pharmacies: list };
+  return order;
 }
 
 TaskManager.defineTask(ORDER_POLL_TASK, async () => {
@@ -1330,7 +1349,8 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
       }
 
       const firstFresh = next.find((order) => !knownOrders.current.has(order.id) && orderCanShowNewPopup(order));
-      if (knownOrders.current.size && firstFresh) {
+      const sessionAlreadyHydrated = knownOrders.current.size > 0;
+      if (firstFresh && (sessionAlreadyHydrated || orderIsRecent(firstFresh))) {
         setFresh(firstFresh);
         // Ring immediately while seller may be on Home/Catalog/More — skip if this order is muted.
         if (!isOrderMuted(firstFresh.id)) void startOrderBell(true);
@@ -1394,6 +1414,8 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
         const code = order && isPrescription(order) ? 'rx_accept' : 'confirmed';
         action(orderId, code).catch(() => openOrder(orderId));
       } else if (orderId) {
+        const tapped = orders.find((item) => item.id === orderId);
+        if (tapped && orderCanShowNewPopup(tapped)) setFresh(tapped);
         openOrder(orderId);
       }
     });
@@ -1401,6 +1423,8 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
       const data = (notification.request.content.data || {}) as Record<string, unknown>;
       const orderId = orderIdFromNotificationData(data);
       void refresh(true, true);
+      const incoming = orders.find((item) => item.id === orderId);
+      if (incoming && orderCanShowNewPopup(incoming)) setFresh(incoming);
       if (orderId && !isOrderMuted(orderId)) void startOrderBell(true);
     });
     const appSub = AppState.addEventListener('change', (state) => {
@@ -2712,16 +2736,52 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
   }
 
   async function submitRx() {
-    const items = rxRows.filter((r) => r.name.trim()).map((r) => ({ product_id: r.product_id, medicine_name: r.name.trim(), quantity: Number(r.qty || 1), fulfill_qty: Number(r.qty || 1), price: Number(r.price || 0), disposition: 'fulfill' }));
+    const requiredLines = rxSelectionLineNumbers(detail.notes);
+    const filled = rxRows.filter((r) => r.name.trim());
+    const items = filled.map((r, idx) => ({
+      product_id: r.product_id,
+      medicine_name: r.name.trim(),
+      quantity: Number(r.qty || 1),
+      fulfill_qty: Number(r.qty || 1),
+      price: Number(r.price || 0),
+      disposition: 'fulfill' as const,
+      ...(requiredLines[idx] ? { rx_line_number: requiredLines[idx] } : {}),
+    }));
     if (!items.length) return Alert.alert('Prescription', 'Add medicines you will supply.');
     setActing(true);
     try {
-      const res = await sellerApi.prescriptionFill({ order_id: detail.id, items, seller_notes: notes, final_status: 'confirmed' });
+      const res = await sellerApi.prescriptionFill({
+        order_id: detail.id,
+        items,
+        seller_notes: notes,
+        final_status: 'confirmed',
+        instructions_reviewed: true,
+      });
       await cancelOrderNotification(detail.id);
       if (res.data) setDetail(res.data);
       else setDetail((current) => current ? { ...current, status: 'confirmed', seller_confirmed_at: new Date().toISOString() } : current);
     } catch (err) {
-      Alert.alert('Prescription', errorMessage(err));
+      const msg = errorMessage(err);
+      if (/review the requested duration/i.test(msg)) {
+        // Live PHP requires this flag; never surface it as a blocking "OK" dialog.
+        try {
+          const res = await sellerApi.prescriptionFill({
+            order_id: detail.id,
+            items,
+            seller_notes: notes,
+            final_status: 'confirmed',
+            instructions_reviewed: true,
+          });
+          await cancelOrderNotification(detail.id);
+          if (res.data) setDetail(res.data);
+          else setDetail((current) => current ? { ...current, status: 'confirmed', seller_confirmed_at: new Date().toISOString() } : current);
+          return;
+        } catch (retryErr) {
+          Alert.alert('Prescription', errorMessage(retryErr));
+          return;
+        }
+      }
+      Alert.alert('Prescription', msg);
     } finally {
       setActing(false);
     }
@@ -2779,7 +2839,6 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
 
   const pending = pendingStatus(detail.status);
   const rx = detail.is_prescription_order || isPrescription(detail);
-  const nearbyForward = nearbyRetailOnly(detail.forward_pharmacies);
   return (
     <View style={[s.screen, { paddingTop: insets.top }]}>
       <Header title={rx ? 'Prescription Order' : detail.order_number} subtitle={detail.status.replace(/_/g, ' ')} onRefresh={reload} onLogout={onBack} />
@@ -2826,6 +2885,10 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
                   <Field label="Qty" value={row.qty} onChangeText={(v) => updateRxRow(idx, { qty: v.replace(/\D/g, '') })} keyboardType="number-pad" compact />
                   <Field label="Price" value={row.price} onChangeText={(v) => updateRxRow(idx, { price: v.replace(/[^0-9.]/g, '') })} keyboardType="decimal-pad" compact />
                 </View>
+                <Danger label="Remove" compact onPress={() => setRxRows((rows) => {
+                  const next = rows.filter((_, i) => i !== idx);
+                  return next.length ? next : [{ name: '', qty: '1', price: '' }];
+                })} />
               </View>
             ))}
             <Secondary label="Add medicine I have" onPress={() => setRxRows((rows) => [...rows, { name: '', qty: '1', price: '' }])} />
@@ -2839,14 +2902,6 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
             </View>
           ))
         )}
-        {nearbyForward.length ? (
-          <View style={s.card}>
-            <Text style={s.itemTitle}>Nearby Pharmacies to Forward</Text>
-            {nearbyForward.map((p) => (
-              <Text key={p.id} style={s.muted}>#{p.id} {formatForwardPharmacy(p)}{p.distance_km != null ? ` • ${p.distance_km} km` : ''}</Text>
-            ))}
-          </View>
-        ) : null}
         <Field label="Notes to customer" value={notes} onChangeText={setNotes} multiline />
         <View style={s.inputRow}>
           <Secondary label={showInvoice ? 'Hide invoice' : 'View invoice'} compact onPress={() => (showInvoice ? setShowInvoice(false) : loadInvoice())} />
