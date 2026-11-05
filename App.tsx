@@ -417,8 +417,10 @@ function prettyDate(raw?: string | null) {
   return raw.slice(0, 16).replace('T', ' ');
 }
 
-function isPrescription(order: Pick<Order, 'order_type'>) {
-  return order.order_type === 'prescription';
+function isPrescription(order: Pick<Order, 'order_type' | 'status'> & { is_prescription_order?: boolean | null }) {
+  return order.order_type === 'prescription'
+    || order.is_prescription_order === true
+    || (order.status ?? '').toLowerCase() === 'prescription_review';
 }
 
 function isVirtualShop(order: Pick<Order, 'is_virtual_shop_order' | 'routed_via'>) {
@@ -544,13 +546,31 @@ function orderAlreadyReadyOrPast(status?: string | null) {
   return ['ready_for_pickup', 'assigned', 'picked_up', 'out_for_delivery', 'delivered', 'completed'].includes(orderStatusKey(status));
 }
 
-function quickActions(status: string) {
-  const s = orderStatusKey(status);
-  if (s === 'confirmed' || s === 'partial_forward') {
-    return [{ code: 'preparing', label: 'Preparing' }, { code: 'ready_for_pickup', label: 'Ready for Pickup' }];
+function quickActions(_status: string) {
+  // Seller app is accept/reject only. Preparing / Ready stay on the seller panel.
+  return [] as Array<{ code: string; label: string }>;
+}
+
+function decisionActionMessage(code: string) {
+  if (code === 'rejected') return 'Rejected by pharmacy';
+  if (code === 'wrong_prescription') return 'Wrong prescription';
+  if (['confirmed', 'preparing', 'cancelled'].includes(code)) return readyActionMessage(code);
+  return undefined;
+}
+
+function orderDecisionActions(order: Order) {
+  if (!pendingStatus(order.status)) return [] as Array<{ code: string; label: string }>;
+  if (isPrescription(order)) {
+    return [
+      { code: 'rx_accept', label: 'Accept' },
+      { code: 'rejected', label: 'Reject' },
+      { code: 'wrong_prescription', label: 'Wrong prescription' },
+    ];
   }
-  if (s === 'preparing') return [{ code: 'ready_for_pickup', label: 'Ready for Pickup' }];
-  return [];
+  return [
+    { code: 'confirmed', label: 'Accept' },
+    { code: 'rejected', label: 'Reject' },
+  ];
 }
 
 /** Live panel marks ready via POST seller/orders/action (triggers exclusive delivery offer). */
@@ -583,11 +603,7 @@ async function markOrderReadyOnce(orderId: number, currentStatus?: string | null
 }
 
 function orderCardActions(order: Order) {
-  if (pendingStatus(order.status)) {
-    if (isPrescription(order)) return order.seller_confirmed_at ? [] : [{ code: 'rx_accept', label: 'Accept' }];
-    return [{ code: 'confirmed', label: 'Accept' }];
-  }
-  return quickActions(order.status);
+  return orderDecisionActions(order);
 }
 
 function useLayoutScale() {
@@ -1506,9 +1522,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
         await refresh(true, true);
         return;
       }
-      const message = ['confirmed', 'preparing', 'rejected', 'cancelled'].includes(code)
-        ? readyActionMessage(code)
-        : undefined;
+      const message = decisionActionMessage(code);
       const res = await sellerApi.orderAction(orderId, code, message);
       await cancelOrderNotification(orderId);
       setFresh((currentFresh) => currentFresh?.id === orderId ? null : currentFresh);
@@ -1547,9 +1561,48 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
     goTab('orders', nextFilter);
   }
 
-  if (selectedOrder) return <OrderDetailScreen order={selectedOrder} dash={dash} onBack={() => { setSelectedOrder(null); refresh(true); }} />;
-  if (showReport) return <ReportsScreen onBack={() => setShowReport(false)} />;
-  if (moreModule) return <MoreModuleScreen module={moreModule} dash={dash} onBack={() => { setMoreModule(null); refresh(true); }} onRefresh={() => refresh(true)} onUnreadChange={(n) => { setNotifUnread(n); syncInboxBadgeCount(n).catch(() => undefined); }} />;
+  const popup = (
+    <NewOrderPopup
+      order={fresh}
+      onClose={() => setFresh(null)}
+      onOpen={() => {
+        const order = fresh;
+        setFresh(null);
+        if (order) openOrder(order.id);
+      }}
+      onAction={(code) => {
+        const order = fresh;
+        if (!order) return;
+        setFresh(null);
+        void action(order.id, code);
+      }}
+    />
+  );
+
+  if (selectedOrder) {
+    return (
+      <View style={{ flex: 1 }}>
+        <OrderDetailScreen order={selectedOrder} dash={dash} onBack={() => { setSelectedOrder(null); refresh(true); }} />
+        {popup}
+      </View>
+    );
+  }
+  if (showReport) {
+    return (
+      <View style={{ flex: 1 }}>
+        <ReportsScreen onBack={() => setShowReport(false)} />
+        {popup}
+      </View>
+    );
+  }
+  if (moreModule) {
+    return (
+      <View style={{ flex: 1 }}>
+        <MoreModuleScreen module={moreModule} dash={dash} onBack={() => { setMoreModule(null); refresh(true); }} onRefresh={() => refresh(true)} onUnreadChange={(n) => { setNotifUnread(n); syncInboxBadgeCount(n).catch(() => undefined); }} />
+        {popup}
+      </View>
+    );
+  }
 
   return (
     <View style={s.screen}>
@@ -1578,7 +1631,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
       </ScrollView>
       <BottomTabs current={tab} setTab={goTab} pending={orders.filter((o) => pendingStatus(o.status)).length} />
       <StockEditModal item={editItem} onClose={() => setEditItem(null)} onSaved={() => { setEditItem(null); refresh(true); }} />
-      <NewOrderPopup order={fresh} onClose={() => setFresh(null)} onOpen={() => { const order = fresh; setFresh(null); if (order) openOrder(order.id); }} />
+      {popup}
     </View>
   );
 }
@@ -2670,9 +2723,7 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
         onBack();
         return;
       }
-      const message = ['confirmed', 'preparing', 'rejected', 'cancelled', 'wrong_prescription'].includes(code)
-        ? readyActionMessage(code)
-        : undefined;
+      const message = decisionActionMessage(code);
       const res = await sellerApi.orderAction(detail.id, code, message);
       await cancelOrderNotification(detail.id);
       const nextStatus = code === 'rx_accept'
@@ -2839,6 +2890,7 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
 
   const pending = pendingStatus(detail.status);
   const rx = detail.is_prescription_order || isPrescription(detail);
+  const decisions = orderDecisionActions(detail);
   return (
     <View style={[s.screen, { paddingTop: insets.top }]}>
       <Header title={rx ? 'Prescription Order' : detail.order_number} subtitle={detail.status.replace(/_/g, ' ')} onRefresh={reload} onLogout={onBack} />
@@ -2852,6 +2904,7 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
             <Text style={s.muted}>{[detail.address_line, detail.city, detail.pincode].filter(Boolean).join(', ')}</Text>
             <View style={s.rowBetween}><Text style={s.amount}>Total {money(detail.total_amount)}</Text>{detail.payment_method ? <Pill text={detail.payment_method.toUpperCase()} tone="blue" /> : null}</View>
           </View>
+          {pending ? <SilenceBell orderId={detail.id} /> : null}
           <CustomerRxDetailsCard source={detail} />
         {rx && mediaUrl(detail.prescription_url) ? (
           <TouchableOpacity activeOpacity={0.9} onPress={() => setRxImageOpen(true)}>
@@ -2865,75 +2918,24 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
             <View style={s.card}>{detail.tracking.map((t, idx) => <Info key={`${t.status}-${idx}`} label={t.status?.replace(/_/g, ' ') || 'Update'} value={`${t.message || ''} ${prettyDate(t.created_at)}`} />)}</View>
           </>
         ) : null}
-        <SectionTitle title={rx ? 'Medicines' : 'Line items'} right={pending && !rx ? 'Set fulfill qty' : undefined} />
-        {rx && pending ? (
+        {(detail.items ?? []).length ? (
           <>
-            {rxRows.map((row, idx) => (
-              <View key={idx} style={s.card}>
-                <Field label="Medicine name" value={row.name} onChangeText={(v) => searchRxCatalog(idx, v)} />
-                {(rxSuggest[idx] ?? []).slice(0, 5).map((product) => (
-                  <TouchableOpacity key={product.product_id ?? product.id ?? product.name} style={s.suggestionRow} onPress={() => chooseRxProduct(idx, product)}>
-                    <View style={{ flex: 1 }}>
-                      <Text style={s.itemTitle}>{product.name}</Text>
-                      <Text style={s.muted}>{product.seller_stock ?? 0} available</Text>
-                    </View>
-                    <Text style={s.itemPrice}>{money(product.price)}</Text>
-                  </TouchableOpacity>
-                ))}
-                {row.name.trim().length >= 2 && !(rxSuggest[idx] ?? []).length ? <Text style={s.muted}>No catalog match yet. Check spelling or add another medicine name.</Text> : null}
-                <View style={s.inputRow}>
-                  <Field label="Qty" value={row.qty} onChangeText={(v) => updateRxRow(idx, { qty: v.replace(/\D/g, '') })} keyboardType="number-pad" compact />
-                  <Field label="Price" value={row.price} onChangeText={(v) => updateRxRow(idx, { price: v.replace(/[^0-9.]/g, '') })} keyboardType="decimal-pad" compact />
-                </View>
-                <Danger label="Remove" compact onPress={() => setRxRows((rows) => {
-                  const next = rows.filter((_, i) => i !== idx);
-                  return next.length ? next : [{ name: '', qty: '1', price: '' }];
-                })} />
+            <SectionTitle title={rx ? 'Medicines' : 'Line items'} />
+            {detail.items?.map((item) => (
+              <View key={item.id} style={s.card}>
+                <Text style={s.itemTitle}>{item.product_name || 'Item'}</Text>
+                <Text style={s.muted}>Ordered {item.quantity ?? 0} • {money(item.price)}</Text>
               </View>
             ))}
-            <Secondary label="Add medicine I have" onPress={() => setRxRows((rows) => [...rows, { name: '', qty: '1', price: '' }])} />
           </>
-        ) : (
-          detail.items?.map((item) => (
-            <View key={item.id} style={s.card}>
-              <Text style={s.itemTitle}>{item.product_name || 'Item'}</Text>
-              <Text style={s.muted}>Ordered {item.quantity ?? 0} • {item.catalog_note || 'New on confirm'} • {money(item.price)}</Text>
-              {pending && !rx ? <Field label="Fulfill" value={fulfill[item.id] || '0'} onChangeText={(v) => setFulfill((m) => ({ ...m, [item.id]: v.replace(/\D/g, '') }))} keyboardType="number-pad" compact /> : null}
-            </View>
-          ))
-        )}
-        <Field label="Notes to customer" value={notes} onChangeText={setNotes} multiline />
-        <View style={s.inputRow}>
-          <Secondary label={showInvoice ? 'Hide invoice' : 'View invoice'} compact onPress={() => (showInvoice ? setShowInvoice(false) : loadInvoice())} />
-          <Primary label="Print bill" compact onPress={() => printCurrentBill().catch((err) => Alert.alert('Print', err instanceof Error ? err.message : errorMessage(err)))} />
-        </View>
-        <Secondary label="Share bill PDF" onPress={() => {
-          const layout = 'thermal_58' as PrinterLayout;
-          shareBillPdf({ ...detail, invoice }, layout, dash?.pharmacy).catch((err) => Alert.alert('Bill', errorMessage(err)));
-        }} />
-        {showInvoice && invoice ? (
-          <View style={s.card}>
-            <Text style={s.itemTitle}>Invoice</Text>
-            {invoice.lines?.map((line, idx) => <Text key={idx} style={s.muted}>{line.name} × {line.quantity ?? 0} = {money(line.line_total ?? line.price)}</Text>)}
-            <Text style={s.amount}>Subtotal {money(invoice.subtotal)} • Delivery {money(invoice.delivery_fee)} • Total {money(invoice.total_amount)}</Text>
-          </View>
+        ) : rx ? (
+          <Text style={s.muted}>Fill medicines and the rest of this order from the seller panel.</Text>
         ) : null}
-        {pending && rx && detail.status === 'prescription_review' && !detail.seller_confirmed_at ? (
-          <Primary label={acting ? 'Accepting...' : 'Accept Prescription'} disabled={acting} onPress={() => run('rx_accept')} />
-        ) : null}
-        {pending && rx ? <Primary label={acting ? 'Saving...' : 'Fill prescription & confirm'} disabled={acting} onPress={submitRx} /> : null}
-        {pending && rx ? <Secondary label={acting ? 'Sending...' : 'Send catalog items to cart'} disabled={acting} onPress={sendRxToCart} /> : null}
-        {rx ? <Secondary label="Message customer" disabled={acting} onPress={sendOrderMessage} /> : null}
-        {pending && !rx ? (
-          <>
-            <Primary label="Confirm & Save" disabled={acting} onPress={() => process('confirmed')} />
-            <Primary label="Accept & Ready for Pickup" disabled={acting} onPress={() => process('ready_for_pickup')} />
-            <Secondary label="Confirm & Start Preparing" disabled={acting} onPress={() => process('preparing')} />
-            <Danger label="Reject order" disabled={acting} onPress={() => process('rejected')} />
-          </>
-        ) : null}
-        {pending && rx ? <Danger label="Wrong prescription" disabled={acting} onPress={() => run('wrong_prescription')} /> : null}
-        {!pending && quickActions(detail.status).map((a) => <Primary key={a.code} label={a.label} disabled={acting} onPress={() => run(a.code)} />)}
+        {decisions.map((a) => (
+          a.code === 'rejected' || a.code === 'wrong_prescription'
+            ? <Danger key={a.code} label={acting ? 'Saving...' : a.label} disabled={acting} onPress={() => run(a.code)} />
+            : <Primary key={a.code} label={acting ? 'Saving...' : a.label} disabled={acting} onPress={() => run(a.code)} />
+        ))}
         </ScrollView>
       </KeyboardAvoidingView>
       <Modal visible={rxImageOpen} animationType="fade" onRequestClose={() => setRxImageOpen(false)}>
@@ -3199,6 +3201,41 @@ function ProductRow({ item, onPress }: { item: InventoryItem; onPress: () => voi
   );
 }
 
+function SilenceBell({ orderId }: { orderId: number }) {
+  const [muted, setMuted] = useState(isOrderMuted(orderId));
+  useEffect(() => {
+    setMuted(isOrderMuted(orderId));
+    return subscribeMutedOrders(() => setMuted(isOrderMuted(orderId)));
+  }, [orderId]);
+
+  async function toggleMute() {
+    if (muted) {
+      await unmuteOrder(orderId);
+      setMuted(false);
+      const prefs = await readPrefs();
+      if (prefs.sound) void startOrderBell(true);
+    } else {
+      await muteOrder(orderId);
+      silenceNativeOrder(orderId);
+      setMuted(true);
+      await stopOrderBell();
+    }
+  }
+
+  return (
+    <Pressable
+      onPress={toggleMute}
+      accessibilityRole="button"
+      accessibilityLabel={muted ? 'Unmute order bell' : 'Silence order ring'}
+      hitSlop={12}
+      style={s.popupBellButton}
+    >
+      <Text style={s.popupBell}>{muted ? '🔕' : '🔔'}</Text>
+      <Text style={s.popupBellHint}>{muted ? 'Ring silenced — tap to ring' : 'Tap bell to silence ring'}</Text>
+    </Pressable>
+  );
+}
+
 function FreshBanner({ order, onOpen, onClose }: { order: Order; onOpen: () => void; onClose: () => void }) {
   return (
     <TouchableOpacity style={s.freshBanner} onPress={onOpen}>
@@ -3208,55 +3245,32 @@ function FreshBanner({ order, onOpen, onClose }: { order: Order; onOpen: () => v
   );
 }
 
-function NewOrderPopup({ order, onOpen, onClose }: { order: Order | null; onOpen: () => void; onClose: () => void }) {
-  const [muted, setMuted] = useState(order ? isOrderMuted(order.id) : false);
-  useEffect(() => {
-    setMuted(order ? isOrderMuted(order.id) : false);
-    return subscribeMutedOrders(() => setMuted(order ? isOrderMuted(order.id) : false));
-  }, [order?.id]);
-
-  async function toggleMute() {
-    if (!order) return;
-    if (muted) {
-      await unmuteOrder(order.id);
-      setMuted(false);
-      const prefs = await readPrefs();
-      if (prefs.sound) void startOrderBell(true);
-    } else {
-      await muteOrder(order.id);
-      silenceNativeOrder(order.id);
-      setMuted(true);
-      await stopOrderBell();
-    }
-  }
-
+function NewOrderPopup({ order, onOpen, onClose, onAction }: { order: Order | null; onOpen: () => void; onClose: () => void; onAction: (code: string) => void }) {
+  const decisions = order ? orderDecisionActions(order) : [];
   return (
     <Modal visible={Boolean(order)} transparent animationType="fade" onRequestClose={onClose}>
       <View style={s.modalShade}>
-        <View style={s.newOrderModal}>
-          <Pressable
-            onPress={toggleMute}
-            accessibilityRole="button"
-            accessibilityLabel={muted ? 'Unmute order bell' : 'Mute order bell'}
-            hitSlop={12}
-            style={s.popupBellButton}
-          >
-            <Text style={s.popupBell}>{muted ? '🔕' : '🔔'}</Text>
-            <Text style={s.popupBellHint}>{muted ? 'Muted — tap to ring' : 'Tap bell to mute'}</Text>
-          </Pressable>
+        <ScrollView style={s.newOrderModal} contentContainerStyle={{ alignItems: 'center', gap: 12, paddingBottom: 8 }} keyboardShouldPersistTaps="handled">
+          {order ? <SilenceBell orderId={order.id} /> : null}
           <Image source={LOGO} style={s.authLogo} resizeMode="contain" />
           <Text style={s.newOrderTitle}>New order received!</Text>
           <Text style={s.newOrderNo}>{order?.order_number}</Text>
           <Text style={s.newOrderBody}>{order?.customer_name || 'Customer'} • {money(order?.total_amount)}</Text>
+          {order && isPrescription(order) ? <Text style={s.rxBadge}>Prescription order</Text> : null}
           {order && hasCustomerRxDetails(order) ? (
             <Text style={s.rxExtrasPreview}>
               {parseCustomerRxDetails(order).map((line) => `${line.label}: ${line.value}`).join('\n')}
             </Text>
           ) : null}
-          <Text style={s.newOrderHint}>{muted ? 'Bell muted for this order. Tap the muted icon to ring again.' : 'Notifications will continue until this order is accepted or moved out of pending.'}</Text>
-          <Primary label="Open order" onPress={onOpen} />
+          <Text style={s.newOrderHint}>Tap the bell to silence this ring — same mute for prescription and normal orders.</Text>
+          {decisions.map((a) => (
+            a.code === 'rejected' || a.code === 'wrong_prescription'
+              ? <Danger key={a.code} label={a.label} onPress={() => onAction(a.code)} />
+              : <Primary key={a.code} label={a.label} onPress={() => onAction(a.code)} />
+          ))}
+          <Secondary label="View order" onPress={onOpen} />
           <Secondary label="Later" onPress={onClose} />
-        </View>
+        </ScrollView>
       </View>
     </Modal>
   );
@@ -3862,7 +3876,7 @@ const s = StyleSheet.create({
   badge: { position: 'absolute', right: -8, top: -6, minWidth: 18, height: 18, borderRadius: 9, backgroundColor: C.redAccent, color: '#FFF', fontWeight: '900', textAlign: 'center', overflow: 'hidden', fontSize: 10, lineHeight: 18 },
   modalShade: { flex: 1, backgroundColor: 'rgba(0,0,0,0.36)', justifyContent: 'center', padding: 22 },
   modalCard: { backgroundColor: C.bg, borderRadius: 22, padding: 20, gap: 12 },
-  newOrderModal: { backgroundColor: C.bg, borderRadius: 24, padding: 22, gap: 12, alignItems: 'center' },
+  newOrderModal: { backgroundColor: C.bg, borderRadius: 24, padding: 22, gap: 12, alignItems: 'center', maxHeight: '90%', width: '100%' },
   popupBellButton: { alignItems: 'center', justifyContent: 'center', paddingVertical: 4, gap: 2 },
   popupBell: { fontSize: 36, lineHeight: 42 },
   popupBellHint: { color: C.muted, fontSize: 11, fontWeight: '700' },
