@@ -13,7 +13,7 @@ import { listPairedPrinters, readSellerPrefs, writeSellerPrefs, type PairedPrint
 import { setOrderWatchSound, silenceNativeOrder, startOrderWatch, stopOrderWatch } from './orderWatch';
 import { hydrateMutedOrderIds, isOrderMuted, muteOrder, subscribeMutedOrders, unmuteOrder } from './mutedOrders';
 import { hasCustomerRxDetails, parseCustomerRxDetails, type CustomerRxSource } from './customerRxDetails';
-import { orderIdFromNotificationData, registerSellerPush, SELLER_FCM_CHANNEL, SELLER_FCM_SOUND } from './sellerPush';
+import { orderIdFromNotificationData, orderStubFromNotificationData, registerSellerPush, SELLER_FCM_CHANNEL, SELLER_FCM_SOUND } from './sellerPush';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -26,6 +26,7 @@ import {
   KeyboardAvoidingView,
   Linking,
   Modal,
+  PanResponder,
   PermissionsAndroid,
   Platform,
   Pressable,
@@ -96,15 +97,21 @@ const TAB_LOGOS: Record<TabKey, number> = {
 };
 
 Notifications.setNotificationHandler({
-  handleNotification: async () => ({
-    shouldShowAlert: true,
-    shouldPlaySound: true,
-    // App icon badge = seller inbox unread only (not pending order count).
-    shouldSetBadge: false,
-    shouldShowBanner: true,
-    shouldShowList: true,
-    priority: Notifications.AndroidNotificationPriority.MAX,
-  }),
+  handleNotification: async (notification) => {
+    await hydrateMutedOrderIds();
+    const data = (notification.request.content.data || {}) as Record<string, unknown>;
+    const orderId = orderIdFromNotificationData(data);
+    const muted = orderId > 0 && isOrderMuted(orderId);
+    return {
+      shouldShowAlert: !muted,
+      shouldPlaySound: !muted,
+      // App icon badge = seller inbox unread only (not pending order count).
+      shouldSetBadge: false,
+      shouldShowBanner: !muted,
+      shouldShowList: !muted,
+      priority: Notifications.AndroidNotificationPriority.MAX,
+    };
+  },
 });
 
 type ApiWrap<T> = { success: boolean; data?: T | null; message?: string | null };
@@ -701,7 +708,14 @@ async function ensureFreshToken() {
 
 async function request<T>(
   path: string,
-  options: { auth?: boolean; method?: 'GET' | 'POST'; body?: unknown; query?: Record<string, string | number | boolean | null | undefined>; retry?: boolean } = {},
+  options: {
+    auth?: boolean;
+    method?: 'GET' | 'POST';
+    body?: unknown;
+    query?: Record<string, string | number | boolean | null | undefined>;
+    retry?: boolean;
+    timeoutMs?: number;
+  } = {},
 ): Promise<ApiWrap<T>> {
   const params = new URLSearchParams();
   Object.entries(options.query ?? {}).forEach(([k, v]) => {
@@ -715,12 +729,13 @@ async function request<T>(
   const bases = options.auth
     ? [API.authBaseUrl, API.authFallbackBaseUrl, API.authLegacyBaseUrl]
     : [API.phpBaseUrl, API.phpFallbackBaseUrl];
+  const timeoutMs = options.timeoutMs ?? (options.auth ? 12000 : 10000);
   let lastError: unknown;
 
   for (let idx = 0; idx < bases.length; idx += 1) {
     const url = `${bases[idx]}/${path.replace(/^\/+/, '')}${params.toString() ? `?${params}` : ''}`;
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 18000);
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
     let response: Response;
     try {
       response = await fetch(url, {
@@ -731,6 +746,9 @@ async function request<T>(
       });
     } catch (err) {
       lastError = err;
+      // Abort/timeout must not walk api.zepmed.org → zepmed.org. That doubled each
+      // call to ~36s and made tapped orders appear 1–2 minutes later.
+      if (isAbortError(err)) break;
       if (idx < bases.length - 1) continue;
       throw err;
     } finally {
@@ -848,9 +866,24 @@ function orderNotificationContent(order: Order) {
   };
 }
 
+async function cancelOrderLocalNotifications(orderId: number, stored?: string) {
+  const ids = orderNotificationIds(orderId);
+  await cancelStoredNotificationIds(stored);
+  await Notifications.cancelScheduledNotificationAsync(ids.now).catch(() => undefined);
+  await Notifications.cancelScheduledNotificationAsync(ids.remind).catch(() => undefined);
+  await Notifications.dismissNotificationAsync(ids.now).catch(() => undefined);
+  await Notifications.dismissNotificationAsync(ids.remind).catch(() => undefined);
+}
+
 async function schedulePendingOrderNotification(order: Order, existing: Record<string, string>, force = false) {
   const key = String(order.id);
   const ids = orderNotificationIds(order.id);
+  if (isOrderMuted(order.id)) {
+    await cancelOrderLocalNotifications(order.id, existing[key]);
+    const next = { ...existing };
+    delete next[key];
+    return next;
+  }
   if (existing[key] && !force) return existing;
   const ok = await ensureNotificationReady();
   if (!ok) return existing;
@@ -860,12 +893,17 @@ async function schedulePendingOrderNotification(order: Order, existing: Record<s
     content: orderNotificationContent(order),
     trigger: null,
   });
-  await Notifications.scheduleNotificationAsync({
-    identifier: ids.remind,
-    content: orderNotificationContent(order),
-    trigger: { seconds: 60, repeats: true, channelId: ORDER_CHANNEL } as Notifications.NotificationTriggerInput,
-  });
-  return { ...existing, [key]: `${ids.now}|${ids.remind}` };
+  // Foreground uses the in-app looping bell. A 60s OS remind here is what
+  // re-rang a few seconds after the seller silenced the popup.
+  if (AppState.currentState !== 'active') {
+    await Notifications.scheduleNotificationAsync({
+      identifier: ids.remind,
+      content: orderNotificationContent(order),
+      trigger: { seconds: 60, repeats: true, channelId: ORDER_CHANNEL } as Notifications.NotificationTriggerInput,
+    });
+    return { ...existing, [key]: `${ids.now}|${ids.remind}` };
+  }
+  return { ...existing, [key]: ids.now };
 }
 
 async function syncInboxBadgeCount(explicitCount?: number) {
@@ -928,7 +966,7 @@ async function syncPendingOrderNotifications(orders: Order[], opts?: { forcePres
   else await stopOrderBell();
 
   for (const [orderId, notificationId] of Object.entries(current)) {
-    if (!pendingIds.has(orderId)) {
+    if (!pendingIds.has(orderId) || isOrderMuted(Number(orderId))) {
       await cancelStoredNotificationIds(notificationId);
       delete next[orderId];
     }
@@ -952,12 +990,7 @@ async function cancelOrderNotification(orderId: number) {
   silenceNativeOrder(orderId);
   await stopOrderBell();
   const map = await readNotificationMap();
-  const ids = orderNotificationIds(orderId);
-  await cancelStoredNotificationIds(map[String(orderId)]);
-  await Notifications.cancelScheduledNotificationAsync(ids.now).catch(() => undefined);
-  await Notifications.cancelScheduledNotificationAsync(ids.remind).catch(() => undefined);
-  await Notifications.dismissNotificationAsync(ids.now).catch(() => undefined);
-  await Notifications.dismissNotificationAsync(ids.remind).catch(() => undefined);
+  await cancelOrderLocalNotifications(orderId, map[String(orderId)]);
   delete map[String(orderId)];
   await writeNotificationMap(map);
 }
@@ -1023,14 +1056,14 @@ const authApi = {
 };
 
 const sellerApi = {
-  dashboard: () => request<DashboardData>('seller/dashboard'),
-  orders: () => request<{ items?: Order[] | null }>('seller/orders'),
-  orderDetail: (orderId: number) => request<OrderDetail>('seller/orders/detail', { query: { order_id: orderId } }),
+  dashboard: () => request<DashboardData>('seller/dashboard', { timeoutMs: 8000 }),
+  orders: () => request<{ items?: Order[] | null }>('seller/orders', { query: { page: 1 }, timeoutMs: 8000 }),
+  orderDetail: (orderId: number) => request<OrderDetail>('seller/orders/detail', { query: { order_id: orderId }, timeoutMs: 8000 }),
   orderInvoice: (orderId: number) => request<OrderDetail>('seller/orders/invoice', { query: { order_id: orderId } }),
   processOrder: (body: unknown) => request<Record<string, unknown>>('seller/orders/process', { body }),
   prescriptionFill: (body: unknown) => request<OrderDetail>('seller/orders/prescription-fill', { body }),
   orderAction: (orderId: number, action: string, message?: string) => request<Record<string, unknown>>('seller/orders/action', { body: { order_id: orderId, action, ...(message ? { message } : {}) } }),
-  inventory: (search = '') => request<{ items?: InventoryItem[] | null }>('seller/inventory', { query: { search, page: 1, limit: 100, status: 'all' } }),
+  inventory: (search = '') => request<{ items?: InventoryItem[] | null }>('seller/inventory', { query: { search, page: 1, limit: 100, status: 'all' }, timeoutMs: 8000 }),
   updateStock: (body: unknown) => request<Record<string, unknown>>('seller/inventory/update', { body }),
   catalogSearch: (search: string) => request<{ items?: CatalogSuggestion[] | null }>('seller/catalog/search', { query: { search, limit: 30 } }),
   dailySalesReport: (from: string, to: string) => request<DailySalesReport>('seller/reports/daily-sales', { query: { from, to } }),
@@ -1318,9 +1351,22 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
   const [fresh, setFresh] = useState<Order | null>(null);
   const [notifUnread, setNotifUnread] = useState(0);
   const knownOrders = useRef<Set<number>>(new Set());
+  const localOrderStubs = useRef<Map<number, Order>>(new Map());
+  const ordersRef = useRef<Order[]>([]);
   const refreshInFlight = useRef(false);
-  const refreshQueued = useRef(false);
+  const refreshQueued = useRef<'orders' | 'full' | false>(false);
   const tabHistory = useRef<TabKey[]>([]);
+  ordersRef.current = orders;
+
+  function rememberIncomingOrder(order: Order) {
+    localOrderStubs.current.set(order.id, order);
+    knownOrders.current.add(order.id);
+    setOrders((list) => (
+      list.some((item) => item.id === order.id)
+        ? list.map((item) => item.id === order.id ? { ...item, ...order } : item)
+        : [order, ...list]
+    ));
+  }
 
   const refreshNotifUnread = useCallback(async () => {
     try {
@@ -1341,7 +1387,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
 
   const refresh = useCallback(async (silent = false, force = false) => {
     if (refreshInFlight.current) {
-      if (force) refreshQueued.current = true;
+      if (force) refreshQueued.current = silent ? 'orders' : 'full';
       return;
     }
     refreshInFlight.current = true;
@@ -1349,39 +1395,39 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
     setError('');
     let nextError = '';
     try {
-      try {
-        const d = await sellerApi.dashboard();
-        setDash(d.data ?? null);
-      } catch (err) {
-        if (!silent || !isAbortError(err)) nextError = errorMessage(err);
-      }
-
-      let next: Order[] = [];
-      try {
+      const loadOrders = async () => {
         const o = await sellerApi.orders();
-        next = (o.data?.items ?? []).sort((a, b) => (b.created_at ?? '').localeCompare(a.created_at ?? '') || b.id - a.id);
-      } catch (err) {
-        if (!silent || !isAbortError(err)) nextError = nextError || errorMessage(err);
-      }
+        let next = (o.data?.items ?? []).sort((a, b) => (b.created_at ?? '').localeCompare(a.created_at ?? '') || b.id - a.id);
+        for (const [id, stub] of localOrderStubs.current) {
+          if (next.some((order) => order.id === id)) localOrderStubs.current.delete(id);
+          else next = [stub, ...next];
+        }
+        const firstFresh = next.find((order) => !knownOrders.current.has(order.id) && orderCanShowNewPopup(order));
+        const sessionAlreadyHydrated = knownOrders.current.size > 0;
+        if (firstFresh && (sessionAlreadyHydrated || orderIsRecent(firstFresh))) {
+          setFresh(firstFresh);
+          if (!isOrderMuted(firstFresh.id)) void startOrderBell(true);
+          else void stopOrderBell();
+        }
+        knownOrders.current = new Set(next.map((order) => order.id));
+        setOrders(next);
+        await syncPendingOrderNotifications(next);
+        return next;
+      };
 
-      const firstFresh = next.find((order) => !knownOrders.current.has(order.id) && orderCanShowNewPopup(order));
-      const sessionAlreadyHydrated = knownOrders.current.size > 0;
-      if (firstFresh && (sessionAlreadyHydrated || orderIsRecent(firstFresh))) {
-        setFresh(firstFresh);
-        // Ring immediately while seller may be on Home/Catalog/More — skip if this order is muted.
-        if (!isOrderMuted(firstFresh.id)) void startOrderBell(true);
-        else void stopOrderBell();
-      }
-      knownOrders.current = new Set(next.map((order) => order.id));
-      setOrders(next);
-      await syncPendingOrderNotifications(next);
-      await refreshNotifUnread();
-
-      try {
-        const inv = await sellerApi.inventory();
-        setInventory(inv.data?.items ?? []);
-      } catch (err) {
-        if (!isAbortError(err) && !inventory.length) nextError = nextError || errorMessage(err);
+      if (silent) {
+        try {
+          await loadOrders();
+        } catch (err) {
+          if (!isAbortError(err)) nextError = errorMessage(err);
+        }
+      } else {
+        await Promise.all([
+          loadOrders().catch((err) => { if (!isAbortError(err)) nextError = nextError || errorMessage(err); }),
+          sellerApi.dashboard().then((d) => setDash(d.data ?? null)).catch((err) => { if (!isAbortError(err)) nextError = nextError || errorMessage(err); }),
+          sellerApi.inventory().then((inv) => setInventory(inv.data?.items ?? [])).catch((err) => { if (!isAbortError(err)) nextError = nextError || errorMessage(err); }),
+          refreshNotifUnread().catch(() => undefined),
+        ]);
       }
       if (nextError) setError(nextError);
     } catch (err) {
@@ -1390,11 +1436,12 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
       setRefreshing(false);
       refreshInFlight.current = false;
       if (refreshQueued.current) {
+        const queued = refreshQueued.current;
         refreshQueued.current = false;
-        refresh(true, true);
+        refresh(queued !== 'full', true);
       }
     }
-  }, [goTab, inventory.length, refreshNotifUnread, tab]);
+  }, [refreshNotifUnread]);
 
   useEffect(() => {
     prepareOrderBell().catch(() => undefined);
@@ -1405,7 +1452,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
     let cancelled = false;
     hydrateMutedOrderIds().finally(() => {
       if (cancelled) return;
-      refresh(true);
+      refresh(false);
       timer = setInterval(() => refresh(true), 15000);
     });
     return () => {
@@ -1425,23 +1472,31 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
       const data = (response.notification.request.content.data || {}) as Record<string, unknown>;
       const orderId = orderIdFromNotificationData(data) || Number(data.orderId || 0);
       const actionId = response.actionIdentifier;
+      const stub = orderStubFromNotificationData(data);
+      const existing = ordersRef.current.find((item) => item.id === orderId);
+      const incoming = stub ? { ...(existing || {}), ...stub } as Order : existing;
+      if (incoming) rememberIncomingOrder(incoming);
       if (orderId && actionId === 'accept') {
-        const order = orders.find((item) => item.id === orderId);
-        const code = order && isPrescription(order) ? 'rx_accept' : 'confirmed';
-        action(orderId, code).catch(() => openOrder(orderId));
+        const code = incoming && isPrescription(incoming) ? 'rx_accept' : 'confirmed';
+        action(orderId, code).catch(() => openOrder(orderId, incoming));
       } else if (orderId) {
-        const tapped = orders.find((item) => item.id === orderId);
-        if (tapped && orderCanShowNewPopup(tapped)) setFresh(tapped);
-        openOrder(orderId);
+        if (incoming && orderCanShowNewPopup(incoming)) setFresh(incoming);
+        openOrder(orderId, incoming);
       }
+      void refresh(true, true);
     });
     const received = Notifications.addNotificationReceivedListener((notification) => {
       const data = (notification.request.content.data || {}) as Record<string, unknown>;
-      const orderId = orderIdFromNotificationData(data);
+      const stub = orderStubFromNotificationData(data);
+      const existing = stub ? ordersRef.current.find((item) => item.id === stub.id) : undefined;
+      const incoming = stub ? { ...(existing || {}), ...stub } as Order : existing;
+      if (incoming) {
+        rememberIncomingOrder(incoming);
+        if (orderCanShowNewPopup(incoming)) setFresh(incoming);
+      }
+      if (incoming && !isOrderMuted(incoming.id)) void startOrderBell(true);
+      else if (stub && !isOrderMuted(stub.id)) void startOrderBell(true);
       void refresh(true, true);
-      const incoming = orders.find((item) => item.id === orderId);
-      if (incoming && orderCanShowNewPopup(incoming)) setFresh(incoming);
-      if (orderId && !isOrderMuted(orderId)) void startOrderBell(true);
     });
     const appSub = AppState.addEventListener('change', (state) => {
       if (state === 'active') {
@@ -1449,14 +1504,18 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
         return;
       }
       stopOrderBell();
-      syncPendingOrderNotifications(orders, { forcePresent: true }).catch(() => undefined);
+      syncPendingOrderNotifications(ordersRef.current, { forcePresent: true }).catch(() => undefined);
+    });
+    const muteSub = subscribeMutedOrders(() => {
+      syncPendingOrderNotifications(ordersRef.current).catch(() => undefined);
     });
     return () => {
       sub.remove();
       received.remove();
       appSub.remove();
+      muteSub();
     };
-  }, [orders, refresh]);
+  }, [refresh]);
 
   useEffect(() => {
     const sub = BackHandler.addEventListener('hardwareBackPress', () => {
@@ -1487,12 +1546,22 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
     return () => sub.remove();
   }, [moreModule, refresh, selectedOrder, showReport, tab]);
 
-  async function openOrder(id: number) {
-    const seed = orders.find((order) => order.id === id);
-    if (seed) setSelectedOrder(withNearbyForward(seed as OrderDetail));
+  async function openOrder(id: number, seed?: Order | null) {
+    const local = seed || ordersRef.current.find((order) => order.id === id) || null;
+    setSelectedOrder(withNearbyForward({
+      id,
+      order_number: local?.order_number || `Order #${id}`,
+      status: local?.status || 'placed',
+      total_amount: local?.total_amount || 0,
+      ...(local || {}),
+    } as OrderDetail));
     try {
       const detail = await sellerApi.orderDetail(id);
-      setSelectedOrder(detail.data ? await ensureNearbyForward(detail.data) : null);
+      if (detail.data) {
+        localOrderStubs.current.delete(id);
+        setSelectedOrder(await ensureNearbyForward(detail.data));
+        rememberIncomingOrder(detail.data);
+      }
     } catch (err) {
       Alert.alert('Order', errorMessage(err));
     }
@@ -1500,7 +1569,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
 
   async function action(orderId: number, code: string) {
     try {
-      const current = orders.find((o) => o.id === orderId);
+      const current = ordersRef.current.find((o) => o.id === orderId);
       if (code === 'ready_for_pickup') {
         if (orderAlreadyReadyOrPast(current?.status)) {
           Alert.alert('Ready', 'Order is already ready for pickup');
@@ -2361,6 +2430,7 @@ function RxRequestsScreen() {
   const [cart, setCart] = useState<Array<{ product_id: number; name: string; quantity: number }>>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [rxImageOpen, setRxImageOpen] = useState(false);
   const load = useCallback(async () => {
     setLoading(true); setError('');
     try { const res = await sellerApi.rxRequests(); setItems(res.data?.items ?? []); }
@@ -2390,7 +2460,17 @@ function RxRequestsScreen() {
   }
   if (selected) return <>
     <TouchableOpacity onPress={() => setSelected(null)}><Text style={s.backText}>‹ Requests</Text></TouchableOpacity>
-    <View style={s.card}><Text style={s.itemTitle}>{selected.customer_name || 'Customer'} Rx</Text><Text style={s.muted}>{selected.status || '-'} • {prettyDate(selected.created_at)}</Text>{selected.prescription_url ? <Image source={{ uri: mediaUrl(selected.prescription_url) }} style={s.rxImage} resizeMode="contain" /> : null}</View>
+    <View style={s.card}>
+      <Text style={s.itemTitle}>{selected.customer_name || 'Customer'} Rx</Text>
+      <Text style={s.muted}>{selected.status || '-'} • {prettyDate(selected.created_at)}</Text>
+      {selected.prescription_url ? (
+        <TouchableOpacity activeOpacity={0.9} onPress={() => setRxImageOpen(true)}>
+          <Image source={{ uri: mediaUrl(selected.prescription_url) }} style={s.rxImage} resizeMode="contain" />
+          <Text style={s.tapHint}>Tap prescription to rotate, zoom and view fullscreen</Text>
+        </TouchableOpacity>
+      ) : null}
+    </View>
+    <RxImageViewer uri={mediaUrl(selected.prescription_url)} visible={rxImageOpen} onClose={() => setRxImageOpen(false)} />
     <CustomerRxDetailsCard source={selected} />
     <Field label="Message / seller notes" value={note} onChangeText={setNote} multiline />
     <SearchBox placeholder="Search medicine from catalog" value={search} onChangeText={searchCatalog} />
@@ -2647,6 +2727,79 @@ function PayoutsScreen() {
       </View>
     ))}
   </>;
+}
+
+function RxImageViewer({ uri, visible, onClose }: { uri?: string | null; visible: boolean; onClose: () => void }) {
+  const insets = useSafeAreaInsets();
+  const { width, height } = useWindowDimensions();
+  const [rotation, setRotation] = useState(0);
+  const [zoom, setZoom] = useState(1);
+  const pan = useRef(new Animated.ValueXY({ x: 0, y: 0 })).current;
+  const zoomRef = useRef(1);
+  zoomRef.current = zoom;
+
+  useEffect(() => {
+    if (!visible) {
+      setRotation(0);
+      setZoom(1);
+      pan.setValue({ x: 0, y: 0 });
+    }
+  }, [visible, pan]);
+
+  const panResponder = useMemo(() => PanResponder.create({
+    onMoveShouldSetPanResponder: (_evt, gesture) => zoomRef.current > 1 && (Math.abs(gesture.dx) > 4 || Math.abs(gesture.dy) > 4),
+    onPanResponderMove: Animated.event([null, { dx: pan.x, dy: pan.y }], { useNativeDriver: false }),
+    onPanResponderRelease: () => {
+      if (zoomRef.current <= 1) pan.setValue({ x: 0, y: 0 });
+    },
+  }), [pan]);
+
+  function resetView() {
+    setRotation(0);
+    setZoom(1);
+    pan.setValue({ x: 0, y: 0 });
+  }
+
+  const sideways = rotation % 180 !== 0;
+  const imageWidth = sideways ? height * 0.72 : width;
+  const imageHeight = sideways ? width : height * 0.72;
+
+  return (
+    <Modal visible={visible} animationType="fade" onRequestClose={onClose}>
+      <View style={[s.imageViewer, { paddingTop: insets.top, paddingBottom: Math.max(insets.bottom, 12) }]}>
+        <View style={s.rxViewerTop}>
+          <TouchableOpacity style={s.imageClose} onPress={onClose}>
+            <Text style={s.imageCloseText}>Close</Text>
+          </TouchableOpacity>
+        </View>
+        <View style={s.rxViewerStage} {...panResponder.panHandlers}>
+          {uri ? (
+            <Animated.View style={{ transform: [...pan.getTranslateTransform(), { scale: zoom }, { rotate: `${rotation}deg` }] }}>
+              <Image source={{ uri }} style={{ width: imageWidth, height: imageHeight }} resizeMode="contain" />
+            </Animated.View>
+          ) : null}
+        </View>
+        <View style={s.rxViewerTools}>
+          <TouchableOpacity style={s.rxToolBtn} onPress={() => setRotation((value) => (value + 90) % 360)}>
+            <Text style={s.rxToolText}>Rotate</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={s.rxToolBtn} onPress={() => setZoom((value) => Math.min(4, Math.round((value + 0.5) * 10) / 10))}>
+            <Text style={s.rxToolText}>Zoom +</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={s.rxToolBtn} onPress={() => setZoom((value) => {
+            const next = Math.max(1, Math.round((value - 0.5) * 10) / 10);
+            if (next <= 1) pan.setValue({ x: 0, y: 0 });
+            return next;
+          })}>
+            <Text style={s.rxToolText}>Zoom −</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={s.rxToolBtn} onPress={resetView}>
+            <Text style={s.rxToolText}>Reset</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+  );
 }
 
 function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: DashboardData | null; onBack: () => void }) {
@@ -2909,7 +3062,7 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
         {rx && mediaUrl(detail.prescription_url) ? (
           <TouchableOpacity activeOpacity={0.9} onPress={() => setRxImageOpen(true)}>
             <Image source={{ uri: mediaUrl(detail.prescription_url) }} style={s.rxImage} resizeMode="contain" />
-            <Text style={s.tapHint}>Tap prescription to view fullscreen</Text>
+            <Text style={s.tapHint}>Tap prescription to rotate, zoom and view fullscreen</Text>
           </TouchableOpacity>
         ) : null}
         {detail.tracking?.length ? (
@@ -2938,14 +3091,7 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
         ))}
         </ScrollView>
       </KeyboardAvoidingView>
-      <Modal visible={rxImageOpen} animationType="fade" onRequestClose={() => setRxImageOpen(false)}>
-        <View style={s.imageViewer}>
-          <TouchableOpacity style={s.imageClose} onPress={() => setRxImageOpen(false)}>
-            <Text style={s.imageCloseText}>Close</Text>
-          </TouchableOpacity>
-          {mediaUrl(detail.prescription_url) ? <Image source={{ uri: mediaUrl(detail.prescription_url) }} style={s.fullRxImage} resizeMode="contain" /> : null}
-        </View>
-      </Modal>
+      <RxImageViewer uri={mediaUrl(detail.prescription_url)} visible={rxImageOpen} onClose={() => setRxImageOpen(false)} />
     </View>
   );
 }
@@ -3219,6 +3365,10 @@ function SilenceBell({ orderId }: { orderId: number }) {
       silenceNativeOrder(orderId);
       setMuted(true);
       await stopOrderBell();
+      const map = await readNotificationMap();
+      await cancelOrderLocalNotifications(orderId, map[String(orderId)]);
+      delete map[String(orderId)];
+      await writeNotificationMap(map);
     }
   }
 
@@ -3247,20 +3397,26 @@ function FreshBanner({ order, onOpen, onClose }: { order: Order; onOpen: () => v
 
 function NewOrderPopup({ order, onOpen, onClose, onAction }: { order: Order | null; onOpen: () => void; onClose: () => void; onAction: (code: string) => void }) {
   const decisions = order ? orderDecisionActions(order) : [];
+  const rxLines = order ? parseCustomerRxDetails(order) : [];
   return (
     <Modal visible={Boolean(order)} transparent animationType="fade" onRequestClose={onClose}>
       <View style={s.modalShade}>
-        <ScrollView style={s.newOrderModal} contentContainerStyle={{ alignItems: 'center', gap: 12, paddingBottom: 8 }} keyboardShouldPersistTaps="handled">
+        <ScrollView style={s.newOrderModal} contentContainerStyle={{ alignItems: 'stretch', gap: 12, paddingBottom: 28 }} keyboardShouldPersistTaps="handled">
           {order ? <SilenceBell orderId={order.id} /> : null}
-          <Image source={LOGO} style={s.authLogo} resizeMode="contain" />
-          <Text style={s.newOrderTitle}>New order received!</Text>
-          <Text style={s.newOrderNo}>{order?.order_number}</Text>
-          <Text style={s.newOrderBody}>{order?.customer_name || 'Customer'} • {money(order?.total_amount)}</Text>
-          {order && isPrescription(order) ? <Text style={s.rxBadge}>Prescription order</Text> : null}
-          {order && hasCustomerRxDetails(order) ? (
-            <Text style={s.rxExtrasPreview}>
-              {parseCustomerRxDetails(order).map((line) => `${line.label}: ${line.value}`).join('\n')}
-            </Text>
+          <Image source={LOGO} style={[s.authLogo, { alignSelf: 'center' }]} resizeMode="contain" />
+          <Text style={[s.newOrderTitle, { textAlign: 'center' }]}>New order received!</Text>
+          <Text style={[s.newOrderNo, { textAlign: 'center' }]}>{order?.order_number}</Text>
+          <Text style={[s.newOrderBody, { textAlign: 'center' }]}>{order?.customer_name || 'Customer'} • {money(order?.total_amount)}</Text>
+          {order && isPrescription(order) ? <Text style={[s.rxBadge, { textAlign: 'center' }]}>Prescription order</Text> : null}
+          {rxLines.length ? (
+            <View style={s.extrasCard}>
+              {rxLines.map((line, idx) => (
+                <View key={`${line.label}-${idx}`} style={{ marginBottom: 8 }}>
+                  <Text style={s.kpiLabel}>{line.label}</Text>
+                  <Text style={s.infoValue}>{line.value}</Text>
+                </View>
+              ))}
+            </View>
           ) : null}
           <Text style={s.newOrderHint}>Tap the bell to silence this ring — same mute for prescription and normal orders.</Text>
           {decisions.map((a) => (
@@ -3851,10 +4007,15 @@ const s = StyleSheet.create({
   rxImage: { height: 250, backgroundColor: '#FFF', borderRadius: 16, borderWidth: 1, borderColor: C.line },
   tapHint: { color: C.muted, textAlign: 'center', fontSize: 12, marginTop: 8 },
   suggestionRow: { borderRadius: 14, borderWidth: 1, borderColor: C.line, backgroundColor: C.beige, padding: 12, flexDirection: 'row', alignItems: 'center', gap: 10 },
-  imageViewer: { flex: 1, backgroundColor: '#000', alignItems: 'center', justifyContent: 'center' },
-  imageClose: { position: 'absolute', top: 44, right: 18, zIndex: 2, minHeight: 42, borderRadius: 22, backgroundColor: 'rgba(255,255,255,0.92)', paddingHorizontal: 18, alignItems: 'center', justifyContent: 'center' },
+  imageViewer: { flex: 1, backgroundColor: '#000' },
+  imageClose: { minHeight: 42, borderRadius: 22, backgroundColor: 'rgba(255,255,255,0.92)', paddingHorizontal: 18, alignItems: 'center', justifyContent: 'center' },
   imageCloseText: { color: C.ink, fontWeight: '900' },
   fullRxImage: { width: '100%', height: '100%' },
+  rxViewerTop: { paddingHorizontal: 16, paddingVertical: 8, alignItems: 'flex-end' },
+  rxViewerStage: { flex: 1, alignItems: 'center', justifyContent: 'center', overflow: 'hidden' },
+  rxViewerTools: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, justifyContent: 'center', paddingHorizontal: 12, paddingTop: 8 },
+  rxToolBtn: { minHeight: 42, borderRadius: 21, backgroundColor: 'rgba(255,255,255,0.92)', paddingHorizontal: 16, alignItems: 'center', justifyContent: 'center' },
+  rxToolText: { color: C.ink, fontWeight: '900', fontSize: 13 },
   extrasCard: { backgroundColor: '#FFF7ED', borderRadius: 16, borderWidth: 1, borderColor: '#F3D6B8', padding: 14, gap: 4 },
   rxExtrasPreview: { color: C.orangeDark, fontSize: 12, fontWeight: '700', lineHeight: 17, marginTop: 6 },
   virtualBanner: { backgroundColor: '#FFF7ED', borderRadius: 14, padding: 12 },
@@ -3874,7 +4035,7 @@ const s = StyleSheet.create({
   tabLabel: { color: C.muted, fontSize: 11, fontWeight: '800', marginTop: 3 },
   tabTextActive: { color: C.teal },
   badge: { position: 'absolute', right: -8, top: -6, minWidth: 18, height: 18, borderRadius: 9, backgroundColor: C.redAccent, color: '#FFF', fontWeight: '900', textAlign: 'center', overflow: 'hidden', fontSize: 10, lineHeight: 18 },
-  modalShade: { flex: 1, backgroundColor: 'rgba(0,0,0,0.36)', justifyContent: 'center', padding: 22 },
+  modalShade: { flex: 1, backgroundColor: 'rgba(0,0,0,0.36)', justifyContent: 'center', paddingHorizontal: 18, paddingVertical: 36 },
   modalCard: { backgroundColor: C.bg, borderRadius: 22, padding: 20, gap: 12 },
   newOrderModal: { backgroundColor: C.bg, borderRadius: 24, padding: 22, gap: 12, alignItems: 'center', maxHeight: '90%', width: '100%' },
   popupBellButton: { alignItems: 'center', justifyContent: 'center', paddingVertical: 4, gap: 2 },
