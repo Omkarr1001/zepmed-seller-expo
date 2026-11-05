@@ -80,8 +80,8 @@ const LOGO = require('./assets/zepmed_logo.jpg');
 const APP_ICON = require('./assets/ic_launcher.png');
 
 const SESSION_KEY = 'zepmed:seller:session';
-const PENDING_NOTIFICATIONS_KEY = 'zepmed:seller:pending-notifications-v4';
-const NOTIF_RESET_KEY = 'zepmed:seller:notif-reset-v4';
+const PENDING_NOTIFICATIONS_KEY = 'zepmed:seller:pending-notifications-v5';
+const NOTIF_RESET_KEY = 'zepmed:seller:notif-reset-v5';
 const ORDER_POLL_TASK = 'zepmed-seller-order-poll';
 const ORDER_NOTIFICATION_CATEGORY = 'zepmed-seller-order-actions';
 const ORDER_CHANNEL = SELLER_FCM_CHANNEL;
@@ -99,9 +99,16 @@ const TAB_LOGOS: Record<TabKey, number> = {
 Notifications.setNotificationHandler({
   handleNotification: async (notification) => {
     await hydrateMutedOrderIds();
+    const identifier = String(notification.request.identifier || '');
     const data = (notification.request.content.data || {}) as Record<string, unknown>;
     const orderId = orderIdFromNotificationData(data);
-    const muted = orderId > 0 && isOrderMuted(orderId);
+    const leftoverRemind = /remind/i.test(identifier);
+    const muted = leftoverRemind || (orderId > 0 && isOrderMuted(orderId));
+    if (muted) {
+      void stopOrderBell();
+      void Notifications.cancelScheduledNotificationAsync(identifier).catch(() => undefined);
+      void Notifications.dismissNotificationAsync(identifier).catch(() => undefined);
+    }
     return {
       shouldShowAlert: !muted,
       shouldPlaySound: !muted,
@@ -823,12 +830,24 @@ async function cancelStoredNotificationIds(stored?: string) {
   }));
 }
 
+async function cancelLeftoverOrderReminds() {
+  const scheduled = await Notifications.getAllScheduledNotificationsAsync().catch(() => []);
+  await Promise.all((scheduled || []).map(async (item) => {
+    const id = String(item.identifier || '');
+    if (/remind/i.test(id) || id.startsWith('zepmed-order-remind-')) {
+      await Notifications.cancelScheduledNotificationAsync(id).catch(() => undefined);
+      await Notifications.dismissNotificationAsync(id).catch(() => undefined);
+    }
+  }));
+}
+
 async function ensureNotificationReady() {
   if (!(await AsyncStorage.getItem(NOTIF_RESET_KEY))) {
     await Notifications.cancelAllScheduledNotificationsAsync().catch(() => undefined);
     await Notifications.dismissAllNotificationsAsync().catch(() => undefined);
     await AsyncStorage.setItem(NOTIF_RESET_KEY, '1');
   }
+  await cancelLeftoverOrderReminds();
   if (Platform.OS === 'android') {
     if (Number(Platform.Version) >= 33) {
       await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS).catch(() => undefined);
@@ -894,23 +913,30 @@ async function cancelOrderLocalNotifications(orderId: number, stored?: string) {
 async function schedulePendingOrderNotification(order: Order, existing: Record<string, string>, force = false) {
   const key = String(order.id);
   const ids = orderNotificationIds(order.id);
-  if (isOrderMuted(order.id)) {
+  if (isOrderMuted(order.id) || silencedOrderIds.has(order.id)) {
     await cancelOrderLocalNotifications(order.id, existing[key]);
     const next = { ...existing };
     delete next[key];
     return next;
   }
   if (existing[key] && !force) return existing;
+  // Foreground uses the in-app looping bell. Presenting an OS notification
+  // here (or a 60s remind) is what re-rang / re-vibrated after Silence.
+  if (AppState.currentState === 'active') {
+    await cancelLeftoverOrderReminds();
+    return existing;
+  }
   const ok = await ensureNotificationReady();
   if (!ok) return existing;
   await cancelStoredNotificationIds(existing[key]);
+  await Notifications.cancelScheduledNotificationAsync(ids.remind).catch(() => undefined);
+  await Notifications.dismissNotificationAsync(ids.remind).catch(() => undefined);
   await Notifications.scheduleNotificationAsync({
     identifier: ids.now,
     content: orderNotificationContent(order),
     trigger: null,
   });
-  // Never schedule a repeating OS remind — FCM covers closed-app, and a
-  // 60s remind is what re-rang after Silence.
+  // Never schedule a repeating OS remind — FCM covers closed-app.
   return { ...existing, [key]: ids.now };
 }
 
@@ -981,7 +1007,9 @@ async function syncPendingOrderNotifications(orders: Order[], opts?: { forcePres
   }
 
   for (const order of alertableOrders) {
-    next = await schedulePendingOrderNotification(order, next, opts?.forcePresent || !appActive);
+    // Never force-reschedule. forcePresent / background re-present was the
+    // 60s OS remind after the seller muted the popup.
+    next = await schedulePendingOrderNotification(order, next, false);
   }
 
   if (!alertableOrders.length) {
@@ -1001,6 +1029,8 @@ async function cancelOrderNotification(orderId: number) {
   await cancelOrderLocalNotifications(orderId, map[String(orderId)]);
   delete map[String(orderId)];
   await writeNotificationMap(map);
+  await Notifications.cancelAllScheduledNotificationsAsync().catch(() => undefined);
+  await cancelLeftoverOrderReminds();
 }
 
 const authApi = {
@@ -1358,6 +1388,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
   const [showReport, setShowReport] = useState(false);
   const [moreModule, setMoreModule] = useState<MoreModule>(null);
   const [fresh, setFresh] = useState<Order | null>(null);
+  const [popupOutcome, setPopupOutcome] = useState<'accepted' | 'rejected' | null>(null);
   const [notifUnread, setNotifUnread] = useState(0);
   const knownOrders = useRef<Set<number>>(new Set());
   const localOrderStubs = useRef<Map<number, Order>>(new Map());
@@ -1417,6 +1448,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
         const sessionAlreadyHydrated = knownOrders.current.size > 0;
         if (firstFresh && (sessionAlreadyHydrated || orderIsRecent(firstFresh))) {
           setFresh(firstFresh);
+          setPopupOutcome(null);
           if (!isOrderMuted(firstFresh.id)) void startOrderBell(true);
           else void stopOrderBell();
         }
@@ -1525,7 +1557,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
         return;
       }
       stopOrderBell();
-      syncPendingOrderNotifications(ordersRef.current, { forcePresent: true }).catch(() => undefined);
+      syncPendingOrderNotifications(ordersRef.current).catch(() => undefined);
     });
     const muteSub = subscribeMutedOrders(() => {
       syncPendingOrderNotifications(ordersRef.current).catch(() => undefined);
@@ -1627,7 +1659,14 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
         }
       }
       await cancelOrderNotification(orderId);
-      setFresh((currentFresh) => currentFresh?.id === orderId ? null : currentFresh);
+      const outcome = code === 'rx_accept' || code === 'confirmed'
+        ? 'accepted' as const
+        : code === 'rejected' || code === 'wrong_prescription'
+          ? 'rejected' as const
+          : null;
+      const showingPopup = fresh?.id === orderId;
+      if (showingPopup && outcome) setPopupOutcome(outcome);
+      else setFresh((currentFresh) => currentFresh?.id === orderId ? null : currentFresh);
       const confirmedAt = typeof res.data?.seller_confirmed_at === 'string' && res.data.seller_confirmed_at
         ? String(res.data.seller_confirmed_at)
         : new Date().toISOString();
@@ -1639,16 +1678,12 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
           ? { ...order, status: nextStatus, seller_confirmed_at: code === 'rx_accept' || code === 'confirmed' ? (order.seller_confirmed_at || confirmedAt) : order.seller_confirmed_at }
           : order
       )));
-      if (code === 'rx_accept') {
-        Alert.alert('Accepted', 'Timer stopped. Fill medicines on the seller panel, then send to the customer.');
-      } else if (code === 'confirmed') {
-        Alert.alert('Accepted', 'Order accepted.');
-      } else if (code === 'rejected') {
-        Alert.alert('Rejected', 'Order rejected.');
-      } else if (code === 'wrong_prescription') {
-        Alert.alert('Rejected', 'Marked as wrong prescription.');
+      if (!showingPopup) {
+        if (outcome === 'accepted') Alert.alert('Order accepted');
+        else if (outcome === 'rejected') Alert.alert('Order rejected');
       }
       void refresh(true, true);
+      return outcome ?? undefined;
     } catch (err) {
       Alert.alert('Action failed', errorMessage(err));
     }
@@ -1678,16 +1713,17 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
   const popup = (
     <NewOrderPopup
       order={fresh}
-      onClose={() => setFresh(null)}
+      outcome={popupOutcome}
+      onClose={() => { setFresh(null); setPopupOutcome(null); }}
       onOpen={() => {
         const order = fresh;
         setFresh(null);
+        setPopupOutcome(null);
         if (order) openOrder(order.id);
       }}
       onAction={(code) => {
         const order = fresh;
         if (!order) return;
-        setFresh(null);
         void action(order.id, code);
       }}
     />
@@ -2957,12 +2993,10 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
           seller_confirmed_at: code === 'rx_accept' || code === 'confirmed' ? confirmedAt : detail.seller_confirmed_at,
         }, latest.data)));
       }
-      if (code === 'rx_accept') {
-        Alert.alert('Accepted', 'Timer stopped. Fill medicines on the seller panel, then send to the customer.');
-      } else if (code === 'confirmed') {
-        Alert.alert('Accepted', 'Order accepted.');
+      if (code === 'rx_accept' || code === 'confirmed') {
+        Alert.alert('Order accepted');
       } else if (code === 'rejected' || code === 'wrong_prescription') {
-        Alert.alert('Rejected', code === 'wrong_prescription' ? 'Marked as wrong prescription.' : 'Order rejected.');
+        Alert.alert('Order rejected');
         onBack();
       }
     } catch (err) {
@@ -3140,7 +3174,11 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
           </View>
           {pending ? <SilenceBell orderId={detail.id} /> : null}
           {rx && hasSellerConfirmedAt(detail.seller_confirmed_at) ? (
-            <Notice tone="success" title="Accepted" body="Fill medicines on the seller panel, then send to the customer. Reject is still available if needed." />
+            <Notice tone="success" title="Order accepted" body="Preparing, ready, fill and print stay on the seller web panel." />
+          ) : !rx && !pending && ['confirmed', 'preparing'].includes(orderStatusKey(detail.status)) ? (
+            <Notice tone="success" title="Order accepted" body="Preparing, ready, fill and print stay on the seller web panel." />
+          ) : orderStatusKey(detail.status) === 'rejected' || orderStatusKey(detail.status) === 'cancelled' ? (
+            <Notice tone="error" title="Order rejected" body="" />
           ) : null}
           <CustomerRxDetailsCard source={detail} />
         {rx && mediaUrl(detail.prescription_url) ? (
@@ -3166,7 +3204,7 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
             ))}
           </>
         ) : rx ? (
-          <Text style={s.muted}>Fill medicines and the rest of this order from the seller panel.</Text>
+          <Text style={s.muted}>No line items yet. Complete fill on the seller web panel.</Text>
         ) : null}
         {decisions.map((a) => (
           a.code === 'rejected' || a.code === 'wrong_prescription'
@@ -3446,16 +3484,11 @@ function SilenceBell({ orderId }: { orderId: number }) {
       if (prefs.sound) void startOrderBell(true);
     } else {
       setMuted(true);
-      muteOrder(orderId).catch(() => undefined);
+      await muteOrder(orderId).catch(() => undefined);
       silenceNativeOrder(orderId);
       silenceOrderAlert(orderId);
-      void stopOrderBell();
-      void (async () => {
-        const map = await readNotificationMap();
-        await cancelOrderLocalNotifications(orderId, map[String(orderId)]);
-        delete map[String(orderId)];
-        await writeNotificationMap(map);
-      })();
+      await stopOrderBell();
+      await cancelOrderNotification(orderId);
     }
   }
 
@@ -3482,16 +3515,30 @@ function FreshBanner({ order, onOpen, onClose }: { order: Order; onOpen: () => v
   );
 }
 
-function NewOrderPopup({ order, onOpen, onClose, onAction }: { order: Order | null; onOpen: () => void; onClose: () => void; onAction: (code: string) => void }) {
-  const decisions = order ? orderDecisionActions(order) : [];
+function NewOrderPopup({
+  order,
+  outcome,
+  onOpen,
+  onClose,
+  onAction,
+}: {
+  order: Order | null;
+  outcome?: 'accepted' | 'rejected' | null;
+  onOpen: () => void;
+  onClose: () => void;
+  onAction: (code: string) => void;
+}) {
+  const decisions = order && !outcome ? orderDecisionActions(order) : [];
   const rxLines = order ? parseCustomerRxDetails(order) : [];
   return (
     <Modal visible={Boolean(order)} transparent animationType="fade" onRequestClose={onClose}>
       <View style={s.modalShade}>
         <ScrollView style={s.newOrderModal} contentContainerStyle={{ alignItems: 'stretch', gap: 12, paddingBottom: 28 }} keyboardShouldPersistTaps="handled">
-          {order ? <SilenceBell orderId={order.id} /> : null}
+          {order && !outcome ? <SilenceBell orderId={order.id} /> : null}
           <Image source={LOGO} style={[s.authLogo, { alignSelf: 'center' }]} resizeMode="contain" />
-          <Text style={[s.newOrderTitle, { textAlign: 'center' }]}>New order received!</Text>
+          <Text style={[s.newOrderTitle, { textAlign: 'center' }]}>
+            {outcome === 'accepted' ? 'Order accepted' : outcome === 'rejected' ? 'Order rejected' : 'New order received!'}
+          </Text>
           <Text style={[s.newOrderNo, { textAlign: 'center' }]}>{order?.order_number}</Text>
           <Text style={[s.newOrderBody, { textAlign: 'center' }]}>{order?.customer_name || 'Customer'} • {money(order?.total_amount)}</Text>
           {order && isPrescription(order) ? <Text style={[s.rxBadge, { textAlign: 'center' }]}>Prescription order</Text> : null}
@@ -3505,14 +3552,16 @@ function NewOrderPopup({ order, onOpen, onClose, onAction }: { order: Order | nu
               ))}
             </View>
           ) : null}
-          <Text style={s.newOrderHint}>Tap the bell to silence this ring — same mute for prescription and normal orders.</Text>
+          {!outcome ? <Text style={s.newOrderHint}>Tap the bell to silence this ring — same mute for prescription and normal orders.</Text> : null}
           {decisions.map((a) => (
             a.code === 'rejected' || a.code === 'wrong_prescription'
               ? <Danger key={a.code} label={a.label} onPress={() => onAction(a.code)} />
               : <Primary key={a.code} label={a.label} onPress={() => onAction(a.code)} />
           ))}
-          <Secondary label="View order" onPress={onOpen} />
-          <Secondary label="Later" onPress={onClose} />
+          <View>
+            <Secondary label="View" onPress={onOpen} />
+            <Text style={[s.newOrderHint, { marginTop: 8 }]} onPress={onClose}>Later</Text>
+          </View>
         </ScrollView>
       </View>
     </Modal>

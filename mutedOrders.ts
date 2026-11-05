@@ -40,7 +40,9 @@ async function persistMuted() {
 export async function hydrateMutedOrderIds() {
   try {
     const raw = await AsyncStorage.getItem(MUTED_ORDER_IDS_KEY);
-    mutedOrderIds.clear();
+    // Merge, never clear first. Clearing dropped an in-memory mute when a
+    // notification handler reloaded storage before persist finished, so the
+    // bell came back a few seconds later.
     for (const id of parseMutedIds(raw)) mutedOrderIds.add(id);
   } catch {
     // Keep whatever is already in memory.
@@ -52,12 +54,12 @@ export async function hydrateMutedOrderIds() {
 export async function muteOrder(orderId: number) {
   if (orderId <= 0) return;
   mutedOrderIds.add(orderId);
-  notifyMuted();
   await persistMuted();
+  notifyMuted();
 }
 
 export async function unmuteOrder(orderId: number) {
   mutedOrderIds.delete(orderId);
-  notifyMuted();
   await persistMuted();
+  notifyMuted();
 }
