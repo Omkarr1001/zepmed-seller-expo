@@ -482,6 +482,16 @@ function pendingStatus(status?: string | null) {
   return ['placed', 'new', 'pending', 'prescription_review'].includes((status ?? '').toLowerCase());
 }
 
+function hasSellerConfirmedAt(value?: string | null) {
+  const v = String(value || '').trim();
+  return v !== '' && v !== '0000-00-00 00:00:00' && v.toLowerCase() !== 'null';
+}
+
+function keepSellerAck<T extends { id: number; seller_confirmed_at?: string | null }>(prev: T | undefined, next: T): T {
+  if (hasSellerConfirmedAt(next.seller_confirmed_at) || !hasSellerConfirmedAt(prev?.seller_confirmed_at)) return next;
+  return { ...next, seller_confirmed_at: prev?.seller_confirmed_at };
+}
+
 function isRxPending(order: Pick<Order, 'order_type' | 'status'> & { is_prescription_order?: boolean | null }) {
   const rx = order.order_type === 'prescription'
     || order.is_prescription_order === true
@@ -568,6 +578,12 @@ function decisionActionMessage(code: string) {
 function orderDecisionActions(order: Order) {
   if (!pendingStatus(order.status)) return [] as Array<{ code: string; label: string }>;
   if (isPrescription(order)) {
+    if (hasSellerConfirmedAt(order.seller_confirmed_at)) {
+      return [
+        { code: 'rejected', label: 'Reject' },
+        { code: 'wrong_prescription', label: 'Wrong prescription' },
+      ];
+    }
     return [
       { code: 'rx_accept', label: 'Accept' },
       { code: 'rejected', label: 'Reject' },
@@ -1392,6 +1408,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
       const loadOrders = async () => {
         const o = await sellerApi.orders();
         let next = (o.data?.items ?? []).sort((a, b) => (b.created_at ?? '').localeCompare(a.created_at ?? '') || b.id - a.id);
+        next = next.map((order) => keepSellerAck(ordersRef.current.find((item) => item.id === order.id), order));
         for (const [id, stub] of localOrderStubs.current) {
           if (next.some((order) => order.id === id)) localOrderStubs.current.delete(id);
           else next = [stub, ...next];
@@ -1611,14 +1628,26 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
       }
       await cancelOrderNotification(orderId);
       setFresh((currentFresh) => currentFresh?.id === orderId ? null : currentFresh);
+      const confirmedAt = typeof res.data?.seller_confirmed_at === 'string' && res.data.seller_confirmed_at
+        ? String(res.data.seller_confirmed_at)
+        : new Date().toISOString();
       const nextStatus = code === 'rx_accept'
         ? (typeof res.data?.status === 'string' ? String(res.data.status) : 'prescription_review')
         : (typeof res.data?.status === 'string' ? String(res.data.status) : code);
       setOrders((list) => list.map((order) => (
         order.id === orderId
-          ? { ...order, status: nextStatus, seller_confirmed_at: order.seller_confirmed_at || new Date().toISOString() }
+          ? { ...order, status: nextStatus, seller_confirmed_at: code === 'rx_accept' || code === 'confirmed' ? (order.seller_confirmed_at || confirmedAt) : order.seller_confirmed_at }
           : order
       )));
+      if (code === 'rx_accept') {
+        Alert.alert('Accepted', 'Timer stopped. Fill medicines on the seller panel, then send to the customer.');
+      } else if (code === 'confirmed') {
+        Alert.alert('Accepted', 'Order accepted.');
+      } else if (code === 'rejected') {
+        Alert.alert('Rejected', 'Order rejected.');
+      } else if (code === 'wrong_prescription') {
+        Alert.alert('Rejected', 'Marked as wrong prescription.');
+      }
       void refresh(true, true);
     } catch (err) {
       Alert.alert('Action failed', errorMessage(err));
@@ -2843,7 +2872,10 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
 
   async function reload() {
     const res = await sellerApi.orderDetail(detail.id);
-    if (res.data) setDetail(await ensureNearbyForward(res.data));
+    if (res.data) {
+      const merged = keepSellerAck(detail, res.data);
+      setDetail(await ensureNearbyForward(merged));
+    }
   }
 
   function updateRxRow(index: number, next: Partial<RxMedicineRow>) {
@@ -2892,14 +2924,47 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
         onBack();
         return;
       }
-      const message = decisionActionMessage(code);
-      const res = await sellerApi.orderAction(detail.id, code, message);
+      const message = decisionActionMessage(code) || (code === 'rejected' ? 'Rejected by pharmacy' : code === 'wrong_prescription' ? 'Wrong prescription' : undefined);
+      let res: ApiWrap<Record<string, unknown>>;
+      try {
+        res = await sellerApi.orderAction(detail.id, code, message);
+      } catch (err) {
+        const msg = errorMessage(err);
+        if (/already accepted/i.test(msg)) {
+          res = { success: true, data: { order_id: detail.id, already: true, status: detail.status || 'prescription_review', seller_confirmed_at: detail.seller_confirmed_at || new Date().toISOString() } };
+        } else if (code === 'rx_accept' && /only prescription review/i.test(msg)) {
+          res = await sellerApi.orderAction(detail.id, 'confirmed', readyActionMessage('confirmed'));
+        } else {
+          throw err;
+        }
+      }
       await cancelOrderNotification(detail.id);
+      const confirmedAt = typeof res.data?.seller_confirmed_at === 'string' && res.data.seller_confirmed_at
+        ? String(res.data.seller_confirmed_at)
+        : new Date().toISOString();
       const nextStatus = code === 'rx_accept'
-        ? 'confirmed'
+        ? (typeof res.data?.status === 'string' ? String(res.data.status) : 'prescription_review')
         : (typeof res.data?.status === 'string' ? String(res.data.status) : code);
-      setDetail((current) => current ? { ...current, status: nextStatus, seller_confirmed_at: current.seller_confirmed_at || new Date().toISOString() } : current);
-      await reload();
+      setDetail((current) => current ? {
+        ...current,
+        status: nextStatus,
+        seller_confirmed_at: code === 'rx_accept' || code === 'confirmed' ? (current.seller_confirmed_at || confirmedAt) : current.seller_confirmed_at,
+      } : current);
+      const latest = await sellerApi.orderDetail(detail.id).catch(() => null);
+      if (latest?.data) {
+        setDetail(await ensureNearbyForward(keepSellerAck({
+          ...detail,
+          seller_confirmed_at: code === 'rx_accept' || code === 'confirmed' ? confirmedAt : detail.seller_confirmed_at,
+        }, latest.data)));
+      }
+      if (code === 'rx_accept') {
+        Alert.alert('Accepted', 'Timer stopped. Fill medicines on the seller panel, then send to the customer.');
+      } else if (code === 'confirmed') {
+        Alert.alert('Accepted', 'Order accepted.');
+      } else if (code === 'rejected' || code === 'wrong_prescription') {
+        Alert.alert('Rejected', code === 'wrong_prescription' ? 'Marked as wrong prescription.' : 'Order rejected.');
+        onBack();
+      }
     } catch (err) {
       Alert.alert('Order', errorMessage(err));
     } finally {
@@ -3074,6 +3139,9 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
             <View style={s.rowBetween}><Text style={s.amount}>Total {money(detail.total_amount)}</Text>{detail.payment_method ? <Pill text={detail.payment_method.toUpperCase()} tone="blue" /> : null}</View>
           </View>
           {pending ? <SilenceBell orderId={detail.id} /> : null}
+          {rx && hasSellerConfirmedAt(detail.seller_confirmed_at) ? (
+            <Notice tone="success" title="Accepted" body="Fill medicines on the seller panel, then send to the customer. Reject is still available if needed." />
+          ) : null}
           <CustomerRxDetailsCard source={detail} />
         {rx && mediaUrl(detail.prescription_url) ? (
           <TouchableOpacity activeOpacity={0.9} onPress={() => setRxImageOpen(true)}>
