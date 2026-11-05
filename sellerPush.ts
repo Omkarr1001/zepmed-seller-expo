@@ -2,6 +2,7 @@ import * as Notifications from 'expo-notifications';
 import { Platform } from 'react-native';
 
 export const SELLER_FCM_CHANNEL = 'zepmed-seller-orders';
+export const SELLER_FCM_QUIET_CHANNEL = 'zepmed-seller-orders-quiet';
 export const SELLER_FCM_SOUND = 'order_bell';
 
 export function isStubPushToken(token?: string | null): boolean {

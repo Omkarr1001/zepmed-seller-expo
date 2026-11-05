@@ -20,7 +20,14 @@ export async function prepareOrderBell() {
  * Safe to call from SellerShell poll while seller is on any tab.
  */
 export async function startOrderBell(vibrate = true) {
-  if (AppState.currentState !== 'active') return;
+  if (AppState.currentState !== 'active') {
+    // Screen off / background: one vibrate pulse, never the looping bell.
+    if (vibrate) {
+      Vibration.cancel();
+      Vibration.vibrate([0, 400, 150, 400, 150, 500], false);
+    }
+    return;
+  }
   if (ringing) {
     // Do not restart the repeating vibrate pattern. Re-calling vibrate() here
     // is what made Silence feel like it failed a few seconds later.

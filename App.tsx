@@ -12,9 +12,10 @@ import { prepareOrderBell, startOrderBell, stopOrderBell } from './orderBell';
 import { listPairedPrinters, readSellerPrefs, writeSellerPrefs, type PairedPrinter } from './printerNative';
 import { setOrderWatchSound, silenceNativeOrder, startOrderWatch, stopOrderWatch } from './orderWatch';
 import { hydrateMutedOrderIds, isOrderMuted, muteOrder, subscribeMutedOrders, unmuteOrder } from './mutedOrders';
+import { hydrateRejectedOrders, mergeRejectedIntoOrders, rememberRejectedOrder } from './rejectedOrders';
 import { hasCustomerRxDetails, parseCustomerRxDetails, type CustomerRxSource } from './customerRxDetails';
 import { mergeIncomingOrder, orderBillAmount, orderCustomerName, popupDecisionActions } from './orderPopup';
-import { orderIdFromNotificationData, orderStubFromNotificationData, registerSellerPush, SELLER_FCM_CHANNEL, SELLER_FCM_SOUND } from './sellerPush';
+import { orderIdFromNotificationData, orderStubFromNotificationData, registerSellerPush, SELLER_FCM_CHANNEL, SELLER_FCM_QUIET_CHANNEL, SELLER_FCM_SOUND } from './sellerPush';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -82,10 +83,12 @@ const APP_ICON = require('./assets/ic_launcher.png');
 
 const SESSION_KEY = 'zepmed:seller:session';
 const PENDING_NOTIFICATIONS_KEY = 'zepmed:seller:pending-notifications-v5';
-const NOTIF_RESET_KEY = 'zepmed:seller:notif-reset-v5';
+const NOTIF_RESET_KEY = 'zepmed:seller:notif-reset-v6';
+const FCM_QUIET_CHANNEL_KEY = 'zepmed:seller:fcm-channel-quiet-v1';
 const ORDER_POLL_TASK = 'zepmed-seller-order-poll';
 const ORDER_NOTIFICATION_CATEGORY = 'zepmed-seller-order-actions';
 const ORDER_CHANNEL = SELLER_FCM_CHANNEL;
+const ORDER_QUIET_CHANNEL = SELLER_FCM_QUIET_CHANNEL;
 const silencedOrderIds = new Set<number>();
 /** Prevent double Ready POSTs — each ready_for_pickup clears delivery_agent_id and re-offers. */
 const readyInFlight = new Set<number>();
@@ -105,6 +108,7 @@ Notifications.setNotificationHandler({
     const orderId = orderIdFromNotificationData(data);
     const leftoverRemind = /remind/i.test(identifier);
     const muted = leftoverRemind || (orderId > 0 && isOrderMuted(orderId));
+    const screenOff = AppState.currentState !== 'active';
     if (muted) {
       void stopOrderBell();
       void Notifications.cancelScheduledNotificationAsync(identifier).catch(() => undefined);
@@ -112,7 +116,8 @@ Notifications.setNotificationHandler({
     }
     return {
       shouldShowAlert: !muted,
-      shouldPlaySound: !muted,
+      // Screen off / background: vibrate only — never play the order bell.
+      shouldPlaySound: !muted && !screenOff,
       // App icon badge = seller inbox unread only (not pending order count).
       shouldSetBadge: false,
       shouldShowBanner: !muted,
@@ -296,7 +301,7 @@ type DailySalesReport = {
 
 type TabKey = 'home' | 'orders' | 'catalog' | 'stock' | 'more';
 type AuthTab = 'password' | 'otp' | 'register';
-type OrderFilter = 'all' | 'pending' | 'rx' | 'preparing' | 'ready' | 'delivered';
+type OrderFilter = 'all' | 'pending' | 'rx' | 'preparing' | 'ready' | 'delivered' | 'rejected';
 type DashboardTarget = 'orders' | 'pending' | 'revenue' | 'delivered';
 type MoreModule = 'pharmacy' | 'settings' | 'notifications' | 'rx' | 'stock' | 'virtual' | 'payouts' | 'wholesale' | 'referral' | 'products' | 'subscription' | 'printer' | null;
 type ReportTab = 'items' | 'orders' | 'rx' | 'virtual' | 'wallet';
@@ -505,6 +510,23 @@ function hasSellerConfirmedAt(value?: string | null) {
 function keepSellerAck<T extends { id: number; seller_confirmed_at?: string | null }>(prev: T | undefined, next: T): T {
   if (hasSellerConfirmedAt(next.seller_confirmed_at) || !hasSellerConfirmedAt(prev?.seller_confirmed_at)) return next;
   return { ...next, seller_confirmed_at: prev?.seller_confirmed_at };
+}
+
+function rejectedLocalOrder(order: Partial<Order> | null | undefined, orderId: number): Order {
+  return {
+    id: orderId,
+    order_number: String(order?.order_number || `Order #${orderId}`),
+    status: 'rejected',
+    total_amount: Number(order?.total_amount || 0) || 0,
+    customer_name: order?.customer_name ?? null,
+    created_at: order?.created_at ?? new Date().toISOString(),
+    payment_method: order?.payment_method ?? null,
+    address_line: order?.address_line ?? null,
+    city: order?.city ?? null,
+    pincode: order?.pincode ?? null,
+    order_type: order?.order_type ?? null,
+    is_prescription_order: order?.is_prescription_order ?? null,
+  };
 }
 
 function isRxPending(order: Pick<Order, 'order_type' | 'status'> & { is_prescription_order?: boolean | null }) {
@@ -843,28 +865,28 @@ async function ensureNotificationReady() {
     if (Number(Platform.Version) >= 33) {
       await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS).catch(() => undefined);
     }
-    await Notifications.setNotificationChannelAsync(ORDER_CHANNEL, {
+    // Android 8+ will not change an existing channel's sound. Delete once so
+    // FCM default `zepmed-seller-orders` is vibrate-only when the screen is off.
+    if (!(await AsyncStorage.getItem(FCM_QUIET_CHANNEL_KEY))) {
+      await Notifications.deleteNotificationChannelAsync(ORDER_CHANNEL).catch(() => undefined);
+      await Notifications.deleteNotificationChannelAsync('zepmed-order-bell-v4').catch(() => undefined);
+      await AsyncStorage.setItem(FCM_QUIET_CHANNEL_KEY, '1');
+    }
+    const quietChannel = {
       name: 'ZepMed seller orders',
-      importance: Notifications.AndroidImportance.MAX,
+      importance: Notifications.AndroidImportance.HIGH,
       vibrationPattern: [0, 400, 150, 400, 150, 500],
-      sound: SELLER_FCM_SOUND,
+      sound: null as string | null,
       enableVibrate: true,
       enableLights: true,
       lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
       bypassDnd: true,
       showBadge: true,
-    });
-    // Keep the older local channel so upgrades still ring if a leftover schedule exists.
-    await Notifications.setNotificationChannelAsync('zepmed-order-bell-v4', {
-      name: 'ZepMed new orders (legacy)',
-      importance: Notifications.AndroidImportance.MAX,
-      vibrationPattern: [0, 400, 150, 400, 150, 500],
-      sound: SELLER_FCM_SOUND,
-      enableVibrate: true,
-      enableLights: true,
-      lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
-      bypassDnd: true,
-      showBadge: true,
+    };
+    await Notifications.setNotificationChannelAsync(ORDER_CHANNEL, quietChannel);
+    await Notifications.setNotificationChannelAsync(ORDER_QUIET_CHANNEL, {
+      ...quietChannel,
+      name: 'ZepMed seller orders (vibrate only)',
     });
   }
   await Notifications.setNotificationCategoryAsync(ORDER_NOTIFICATION_CATEGORY, [
@@ -879,11 +901,11 @@ async function ensureNotificationReady() {
   return true;
 }
 
-function orderNotificationContent(order: Order) {
+function orderNotificationContent(order: Order, quiet = false) {
   return {
     title: `New order ${order.order_number || ''}`.trim(),
     body: `${orderCustomerName(order.customer_name) || 'Customer'} • ${money(orderBillAmount(order) || order.total_amount)}. Tap to open and accept.`,
-    sound: SELLER_FCM_SOUND,
+    sound: quiet ? false : SELLER_FCM_SOUND,
     data: { orderId: order.id },
     categoryIdentifier: ORDER_NOTIFICATION_CATEGORY,
     sticky: true,
@@ -924,7 +946,10 @@ async function schedulePendingOrderNotification(order: Order, existing: Record<s
   await Notifications.dismissNotificationAsync(ids.remind).catch(() => undefined);
   await Notifications.scheduleNotificationAsync({
     identifier: ids.now,
-    content: orderNotificationContent(order),
+    content: {
+      ...orderNotificationContent(order, true),
+      ...(Platform.OS === 'android' ? { channelId: ORDER_QUIET_CHANNEL } : {}),
+    },
     trigger: null,
   });
   // Never schedule a repeating OS remind — FCM covers closed-app.
@@ -1087,7 +1112,7 @@ const authApi = {
 const sellerApi = {
   dashboard: () => request<DashboardData>('seller/dashboard', { timeoutMs: 8000 }),
   livePulse: () => request<{ orders?: string | null; rx?: string | null; notifications?: string | null }>('seller/live-pulse', { timeoutMs: 5000 }),
-  orders: () => request<{ items?: Order[] | null }>('seller/orders', { query: { page: 1, limit: 50 }, timeoutMs: 12000 }),
+  orders: () => request<{ items?: Order[] | null }>('seller/orders', { query: { page: 1, limit: 100 }, timeoutMs: 12000 }),
   orderDetail: (orderId: number) => request<OrderDetail>('seller/orders/detail', { query: { order_id: orderId }, timeoutMs: 12000 }),
   orderInvoice: (orderId: number) => request<OrderDetail>('seller/orders/invoice', { query: { order_id: orderId } }),
   processOrder: (body: unknown) => request<Record<string, unknown>>('seller/orders/process', { body }),
@@ -1384,11 +1409,13 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
   const knownOrders = useRef<Set<number>>(new Set());
   const localOrderStubs = useRef<Map<number, Order>>(new Map());
   const ordersRef = useRef<Order[]>([]);
+  const dashRef = useRef<DashboardData | null>(null);
   const refreshInFlight = useRef(false);
   const refreshQueued = useRef<'orders' | 'full' | false>(false);
   const lastOrdersPulse = useRef('');
   const tabHistory = useRef<TabKey[]>([]);
   ordersRef.current = orders;
+  dashRef.current = dash;
 
   function rememberIncomingOrder(order: Order) {
     const prev = localOrderStubs.current.get(order.id) || ordersRef.current.find((item) => item.id === order.id);
@@ -1438,6 +1465,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
           if (next.some((order) => order.id === id)) localOrderStubs.current.delete(id);
           else next = [stub, ...next];
         }
+        next = mergeRejectedIntoOrders(next);
         const firstFresh = next.find((order) => !knownOrders.current.has(order.id) && orderCanShowNewPopup(order));
         const sessionAlreadyHydrated = knownOrders.current.size > 0;
         if (firstFresh && (sessionAlreadyHydrated || orderIsRecent(firstFresh))) {
@@ -1452,8 +1480,9 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
             else if (current.id === firstFresh.id) nextFresh = mergeIncomingOrder(current, firstFresh);
           }
           if (!nextFresh) return nextFresh;
-          const full = next.find((order) => order.id === nextFresh.id);
-          return full ? mergeIncomingOrder(nextFresh, full) : nextFresh;
+          const openFresh = nextFresh;
+          const full = next.find((order) => order.id === openFresh.id);
+          return full ? mergeIncomingOrder(openFresh, full) : openFresh;
         });
         knownOrders.current = new Set(next.map((order) => order.id));
         setOrders(next);
@@ -1467,13 +1496,22 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
             try {
               const pulse = await sellerApi.livePulse();
               const stamp = String(pulse.data?.orders || '');
-              if (stamp && stamp === lastOrdersPulse.current) return;
+              const haveData = !!dashRef.current && ordersRef.current.length > 0;
+              if (haveData && stamp && stamp === lastOrdersPulse.current) return;
               if (stamp) lastOrdersPulse.current = stamp;
             } catch {
               // live-pulse may 404 on older PHP — fall through to full list.
             }
           }
-          await loadOrders();
+          const jobs: Promise<unknown>[] = [loadOrders()];
+          if (!dashRef.current) {
+            jobs.push(
+              sellerApi.dashboard().then((d) => setDash(d.data ?? null)).catch((err) => {
+                if (!isAbortError(err)) nextError = nextError || errorMessage(err);
+              }),
+            );
+          }
+          await Promise.all(jobs);
         } catch (err) {
           if (!isAbortError(err)) nextError = errorMessage(err);
         }
@@ -1506,11 +1544,12 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
   useEffect(() => {
     let timer: ReturnType<typeof setInterval> | undefined;
     let cancelled = false;
-    hydrateMutedOrderIds().finally(() => {
+    void hydrateMutedOrderIds();
+    void hydrateRejectedOrders().finally(() => {
       if (cancelled) return;
-      refresh(false);
-      timer = setInterval(() => refresh(true), 15000);
+      refresh(false, true);
     });
+    timer = setInterval(() => refresh(true), 15000);
     return () => {
       cancelled = true;
       if (timer) clearInterval(timer);
@@ -1560,9 +1599,12 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
     });
     const appSub = AppState.addEventListener('change', (state) => {
       if (state === 'active') {
-        refresh(true);
+        readPrefs().then((prefs) => setOrderWatchSound(prefs.sound)).catch(() => undefined);
+        const empty = !dashRef.current || !ordersRef.current.length;
+        refresh(empty ? false : true, true);
         return;
       }
+      setOrderWatchSound(false);
       stopOrderBell();
       syncPendingOrderNotifications(ordersRef.current).catch(() => undefined);
     });
@@ -1688,14 +1730,27 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
       const confirmedAt = typeof res.data?.seller_confirmed_at === 'string' && res.data.seller_confirmed_at
         ? String(res.data.seller_confirmed_at)
         : new Date().toISOString();
-      const nextStatus = code === 'rx_accept'
-        ? (typeof res.data?.status === 'string' ? String(res.data.status) : 'prescription_review')
-        : (typeof res.data?.status === 'string' ? String(res.data.status) : code);
-      setOrders((list) => list.map((order) => (
-        order.id === orderId
-          ? { ...order, status: nextStatus, seller_confirmed_at: code === 'rx_accept' || code === 'confirmed' ? (order.seller_confirmed_at || confirmedAt) : order.seller_confirmed_at }
-          : order
-      )));
+      const nextStatus = outcome === 'rejected'
+        ? 'rejected'
+        : code === 'rx_accept'
+          ? (typeof res.data?.status === 'string' ? String(res.data.status) : 'prescription_review')
+          : (typeof res.data?.status === 'string' ? String(res.data.status) : code);
+      if (outcome === 'rejected') {
+        const snap = rejectedLocalOrder(current, orderId);
+        await rememberRejectedOrder(snap);
+        setOrders((list) => {
+          const next = list.some((order) => order.id === orderId)
+            ? list.map((order) => (order.id === orderId ? { ...order, status: 'rejected' } : order))
+            : [snap, ...list];
+          return mergeRejectedIntoOrders(next);
+        });
+      } else {
+        setOrders((list) => list.map((order) => (
+          order.id === orderId
+            ? { ...order, status: nextStatus, seller_confirmed_at: code === 'rx_accept' || code === 'confirmed' ? (order.seller_confirmed_at || confirmedAt) : order.seller_confirmed_at }
+            : order
+        )));
+      }
       if (!showingPopup) {
         if (outcome === 'accepted') Alert.alert('Order accepted');
         else if (outcome === 'rejected') Alert.alert('Order rejected');
@@ -1750,7 +1805,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
   if (selectedOrder) {
     return (
       <View style={{ flex: 1 }}>
-        <OrderDetailScreen order={selectedOrder} dash={dash} onBack={() => { setSelectedOrder(null); refresh(true); }} />
+        <OrderDetailScreen order={selectedOrder} dash={dash} onBack={() => { setSelectedOrder(null); refresh(true, true); }} />
         {popup}
       </View>
     );
@@ -1839,8 +1894,7 @@ function HomeScreen({
   onStoreToggle: (nextOpen: boolean) => void;
 }) {
   const { narrow } = useLayoutScale();
-  if (!dash) return <CenteredLoader />;
-  const open = dash.is_open !== false && dash.is_open !== 0;
+  const open = !dash || (dash.is_open !== false && dash.is_open !== 0);
   // Pending = not yet accepted only (placed/new/prescription_review). Do NOT use pending_dispatch.
   const pendingCount = orders.filter((o) => pendingStatus(o.status)).length;
   const preparingCount = orders.filter((o) => ['confirmed', 'preparing', 'partial_forward'].includes(orderStatusKey(o.status))).length;
@@ -1851,8 +1905,8 @@ function HomeScreen({
       <View style={s.dashboardCard}>
         <View style={s.rowBetween}>
           <View style={{ flex: 1, minWidth: 0 }}>
-            <Text style={s.bigTitle} numberOfLines={2}>{dash.pharmacy?.name || 'Your pharmacy'}</Text>
-            <Text style={s.muted} numberOfLines={1}>{dash.pharmacy?.city || 'Seller dashboard'}</Text>
+            <Text style={s.bigTitle} numberOfLines={2}>{dash?.pharmacy?.name || 'Your pharmacy'}</Text>
+            <Text style={s.muted} numberOfLines={1}>{dash?.pharmacy?.city || 'Seller dashboard'}</Text>
           </View>
           <Pill text={open ? 'Open' : 'Closed'} tone={open ? 'green' : 'red'} />
         </View>
@@ -1893,20 +1947,20 @@ function HomeScreen({
 
         <Text style={s.dashSectionLabel}>Today overview</Text>
         <View style={s.summaryGrid}>
-          <SummaryTile label="Total orders" value={String(dash.orders_total ?? 0)} onPress={() => onDashboardTarget('orders')} />
-          <SummaryTile label="Revenue" value={shortMoney(dash.revenue_total)} onPress={() => onDashboardTarget('revenue')} />
-          <SummaryTile label="Delivered" value={String(dash.delivered_count ?? 0)} onPress={() => onDashboardTarget('delivered')} />
-          <SummaryTile label="Wallet" value={shortMoney(dash.pharmacy_wallet_balance)} onPress={() => onDashboardTarget('orders')} />
+          <SummaryTile label="Total orders" value={dash ? String(dash.orders_total ?? 0) : '—'} onPress={() => onDashboardTarget('orders')} />
+          <SummaryTile label="Revenue" value={dash ? shortMoney(dash.revenue_total) : '—'} onPress={() => onDashboardTarget('revenue')} />
+          <SummaryTile label="Delivered" value={dash ? String(dash.delivered_count ?? 0) : '—'} onPress={() => onDashboardTarget('delivered')} />
+          <SummaryTile label="Wallet" value={dash ? shortMoney(dash.pharmacy_wallet_balance) : '—'} onPress={() => onDashboardTarget('orders')} />
         </View>
       </View>
 
-      {(dash.inventory_low_stock ?? 0) > 0 ? (
+      {(dash?.inventory_low_stock ?? 0) > 0 ? (
         <View style={[s.infoCard, { backgroundColor: C.yellowSoft }]}>
-          <Text style={[s.infoTitle, { color: C.yellow }]}>{dash.inventory_low_stock} products low in stock</Text>
+          <Text style={[s.infoTitle, { color: C.yellow }]}>{dash?.inventory_low_stock} products low in stock</Text>
           <Text style={[s.infoText, { color: C.yellow }]}>Review stock or buy from a wholesaler.</Text>
         </View>
       ) : null}
-      {dash.drug_license?.message ? (
+      {dash?.drug_license?.message ? (
         <View style={[s.infoCard, { backgroundColor: dash.drug_license.restricted ? C.redSoft : C.yellowSoft }]}>
           <Text style={[s.infoTitle, { color: dash.drug_license.restricted ? C.red : C.yellow }]}>Drug license {dash.drug_license.status || ''}</Text>
           <Text style={[s.infoText, { color: dash.drug_license.restricted ? C.red : C.yellow }]}>
@@ -1944,6 +1998,7 @@ function OrdersScreen({
       preparing: ['confirmed', 'preparing'],
       ready: ['ready_for_pickup'],
       delivered: ['delivered', 'completed'],
+      rejected: ['rejected', 'cancelled'],
     };
     const q = query.trim().toLowerCase();
     return orders.filter((o) => {
@@ -1957,7 +2012,7 @@ function OrdersScreen({
       <SearchBox placeholder="Search order #, customer, address..." value={query} onChangeText={setQuery} />
       <Segment<OrderFilter>
         value={filter}
-        options={[['all', 'All'], ['pending', 'Pending'], ['rx', 'Prescription'], ['preparing', 'Preparing'], ['ready', 'Ready'], ['delivered', 'Delivered']]}
+        options={[['all', 'All'], ['pending', 'Pending'], ['rx', 'Prescription'], ['preparing', 'Preparing'], ['ready', 'Ready'], ['delivered', 'Delivered'], ['rejected', 'Rejected']]}
         onChange={onFilter}
         dark
       />
@@ -3013,6 +3068,8 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
       if (code === 'rx_accept' || code === 'confirmed') {
         Alert.alert('Order accepted');
       } else if (code === 'rejected' || code === 'wrong_prescription') {
+        await rememberRejectedOrder(rejectedLocalOrder(detail, detail.id));
+        setDetail((current) => current ? { ...current, status: 'rejected' } : current);
         Alert.alert('Order rejected');
         onBack();
       }
@@ -3062,6 +3119,7 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
       await sellerApi.processOrder(processPayload(finalStatus));
       await cancelOrderNotification(detail.id);
       setDetail((current) => current ? { ...current, status: finalStatus, seller_confirmed_at: current.seller_confirmed_at || new Date().toISOString() } : current);
+      if (finalStatus === 'rejected') await rememberRejectedOrder(rejectedLocalOrder(detail, detail.id));
       await reload();
       if (finalStatus === 'rejected') onBack();
     } catch (err) {

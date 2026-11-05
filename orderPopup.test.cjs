@@ -93,8 +93,8 @@ assert.ok(!src.includes('{fresh ? <FreshBanner'));
 
 const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
 const app = JSON.parse(fs.readFileSync(path.join(__dirname, 'app.json'), 'utf8'));
-assert.strictEqual(pkg.version, '1.0.10');
-assert.strictEqual(app.expo.version, '1.0.10');
-assert.strictEqual(app.expo.android.versionCode, 11);
+assert.strictEqual(pkg.version, '1.0.11');
+assert.strictEqual(app.expo.version, '1.0.11');
+assert.strictEqual(app.expo.android.versionCode, 12);
 
-console.log('orderPopup 1.0.10 bill merge + single Accept ok');
+console.log('orderPopup 1.0.11 bill merge + single Accept ok');
