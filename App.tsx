@@ -494,10 +494,10 @@ function orderCanShowNewPopup(order: Order) {
   if (!pendingStatus(order.status)) return false;
   if (order.forwarded_to_me) return false;
   if (order.viewer_is_owner === false) return false;
-  // Rx stays in prescription_review until fill. seller_confirmed_at / accept
-  // timeout may be set by rx_accept or a DB default — still ring + popup.
+  // App Accept (rx_accept / confirmed) sets seller_confirmed_at and must
+  // stop the ring even while Rx stays in prescription_review for fill on panel.
+  if (order.seller_confirmed_at) return false;
   if (!isRxPending(order)) {
-    if (order.seller_confirmed_at) return false;
     if (order.accept_seconds_remaining != null) return Number(order.accept_seconds_remaining) > 0;
     if (order.accept_deadline_at) {
       const normalized = order.accept_deadline_at.includes('T') ? order.accept_deadline_at : order.accept_deadline_at.replace(' ', 'T');
@@ -893,16 +893,8 @@ async function schedulePendingOrderNotification(order: Order, existing: Record<s
     content: orderNotificationContent(order),
     trigger: null,
   });
-  // Foreground uses the in-app looping bell. A 60s OS remind here is what
-  // re-rang a few seconds after the seller silenced the popup.
-  if (AppState.currentState !== 'active') {
-    await Notifications.scheduleNotificationAsync({
-      identifier: ids.remind,
-      content: orderNotificationContent(order),
-      trigger: { seconds: 60, repeats: true, channelId: ORDER_CHANNEL } as Notifications.NotificationTriggerInput,
-    });
-    return { ...existing, [key]: `${ids.now}|${ids.remind}` };
-  }
+  // Never schedule a repeating OS remind — FCM covers closed-app, and a
+  // 60s remind is what re-rang after Silence.
   return { ...existing, [key]: ids.now };
 }
 
@@ -1057,12 +1049,13 @@ const authApi = {
 
 const sellerApi = {
   dashboard: () => request<DashboardData>('seller/dashboard', { timeoutMs: 8000 }),
-  orders: () => request<{ items?: Order[] | null }>('seller/orders', { query: { page: 1 }, timeoutMs: 8000 }),
-  orderDetail: (orderId: number) => request<OrderDetail>('seller/orders/detail', { query: { order_id: orderId }, timeoutMs: 8000 }),
+  livePulse: () => request<{ orders?: string | null; rx?: string | null; notifications?: string | null }>('seller/live-pulse', { timeoutMs: 5000 }),
+  orders: () => request<{ items?: Order[] | null }>('seller/orders', { query: { page: 1, limit: 50 }, timeoutMs: 12000 }),
+  orderDetail: (orderId: number) => request<OrderDetail>('seller/orders/detail', { query: { order_id: orderId }, timeoutMs: 12000 }),
   orderInvoice: (orderId: number) => request<OrderDetail>('seller/orders/invoice', { query: { order_id: orderId } }),
   processOrder: (body: unknown) => request<Record<string, unknown>>('seller/orders/process', { body }),
   prescriptionFill: (body: unknown) => request<OrderDetail>('seller/orders/prescription-fill', { body }),
-  orderAction: (orderId: number, action: string, message?: string) => request<Record<string, unknown>>('seller/orders/action', { body: { order_id: orderId, action, ...(message ? { message } : {}) } }),
+  orderAction: (orderId: number, action: string, message?: string) => request<Record<string, unknown>>('seller/orders/action', { body: { order_id: orderId, action, ...(message ? { message } : {}) }, timeoutMs: 25000 }),
   inventory: (search = '') => request<{ items?: InventoryItem[] | null }>('seller/inventory', { query: { search, page: 1, limit: 100, status: 'all' }, timeoutMs: 8000 }),
   updateStock: (body: unknown) => request<Record<string, unknown>>('seller/inventory/update', { body }),
   catalogSearch: (search: string) => request<{ items?: CatalogSuggestion[] | null }>('seller/catalog/search', { query: { search, limit: 30 } }),
@@ -1355,6 +1348,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
   const ordersRef = useRef<Order[]>([]);
   const refreshInFlight = useRef(false);
   const refreshQueued = useRef<'orders' | 'full' | false>(false);
+  const lastOrdersPulse = useRef('');
   const tabHistory = useRef<TabKey[]>([]);
   ordersRef.current = orders;
 
@@ -1417,6 +1411,16 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
 
       if (silent) {
         try {
+          if (!force) {
+            try {
+              const pulse = await sellerApi.livePulse();
+              const stamp = String(pulse.data?.orders || '');
+              if (stamp && stamp === lastOrdersPulse.current) return;
+              if (stamp) lastOrdersPulse.current = stamp;
+            } catch {
+              // live-pulse may 404 on older PHP — fall through to full list.
+            }
+          }
           await loadOrders();
         } catch (err) {
           if (!isAbortError(err)) nextError = errorMessage(err);
@@ -1591,19 +1595,31 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
         await refresh(true, true);
         return;
       }
-      const message = decisionActionMessage(code);
-      const res = await sellerApi.orderAction(orderId, code, message);
+      const message = decisionActionMessage(code) || (code === 'rejected' ? 'Rejected by pharmacy' : code === 'wrong_prescription' ? 'Wrong prescription' : undefined);
+      let res: ApiWrap<Record<string, unknown>>;
+      try {
+        res = await sellerApi.orderAction(orderId, code, message);
+      } catch (err) {
+        const msg = errorMessage(err);
+        if (/already accepted/i.test(msg)) {
+          res = { success: true, data: { order_id: orderId, already: true, status: current?.status || 'prescription_review' } };
+        } else if (code === 'rx_accept' && /only prescription review/i.test(msg)) {
+          res = await sellerApi.orderAction(orderId, 'confirmed', readyActionMessage('confirmed'));
+        } else {
+          throw err;
+        }
+      }
       await cancelOrderNotification(orderId);
       setFresh((currentFresh) => currentFresh?.id === orderId ? null : currentFresh);
       const nextStatus = code === 'rx_accept'
-        ? 'confirmed'
+        ? (typeof res.data?.status === 'string' ? String(res.data.status) : 'prescription_review')
         : (typeof res.data?.status === 'string' ? String(res.data.status) : code);
       setOrders((list) => list.map((order) => (
         order.id === orderId
           ? { ...order, status: nextStatus, seller_confirmed_at: order.seller_confirmed_at || new Date().toISOString() }
           : order
       )));
-      await refresh(true, true);
+      void refresh(true, true);
     } catch (err) {
       Alert.alert('Action failed', errorMessage(err));
     }
@@ -3356,19 +3372,22 @@ function SilenceBell({ orderId }: { orderId: number }) {
 
   async function toggleMute() {
     if (muted) {
-      await unmuteOrder(orderId);
       setMuted(false);
+      void unmuteOrder(orderId);
       const prefs = await readPrefs();
       if (prefs.sound) void startOrderBell(true);
     } else {
-      await muteOrder(orderId);
-      silenceNativeOrder(orderId);
       setMuted(true);
-      await stopOrderBell();
-      const map = await readNotificationMap();
-      await cancelOrderLocalNotifications(orderId, map[String(orderId)]);
-      delete map[String(orderId)];
-      await writeNotificationMap(map);
+      muteOrder(orderId).catch(() => undefined);
+      silenceNativeOrder(orderId);
+      silenceOrderAlert(orderId);
+      void stopOrderBell();
+      void (async () => {
+        const map = await readNotificationMap();
+        await cancelOrderLocalNotifications(orderId, map[String(orderId)]);
+        delete map[String(orderId)];
+        await writeNotificationMap(map);
+      })();
     }
   }
 
