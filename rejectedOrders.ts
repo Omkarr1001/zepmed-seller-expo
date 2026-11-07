@@ -69,6 +69,16 @@ export function rejectedList(): RejectedSnap[] {
   return [...rejectedById.values()];
 }
 
+export function isOrderRejected(orderId: number) {
+  return rejectedById.has(orderId);
+}
+
+export function applyRejectedStatus<T extends { id: number; status?: string | null }>(order: T): T {
+  if (!rejectedById.has(order.id)) return order;
+  if (String(order.status || '').toLowerCase() === 'rejected') return order;
+  return { ...order, status: 'rejected' };
+}
+
 export function mergeRejectedSnaps<T extends { id: number; status?: string | null }>(
   orders: T[],
   snaps: ReadonlyArray<{ id: number; status?: string | null }>,

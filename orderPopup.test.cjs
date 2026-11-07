@@ -86,6 +86,9 @@ const push = fs.readFileSync(path.join(__dirname, 'sellerPush.ts'), 'utf8');
 assert.ok(src.includes('Bill loading'));
 assert.ok(src.includes('popupDecisionActions(order)'));
 assert.ok(src.includes("label=\"View\""));
+assert.ok(src.includes('isOrderRejected'));
+assert.ok(src.includes("rejected ? 'Order rejected'"));
+assert.ok(src.includes('<Secondary label="Close"'));
 assert.ok(src.includes('mergeIncomingOrder'));
 assert.ok(helpers.includes('customer_payable'));
 assert.ok(push.includes('customer_payable'));
@@ -93,8 +96,11 @@ assert.ok(!src.includes('{fresh ? <FreshBanner'));
 
 const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
 const app = JSON.parse(fs.readFileSync(path.join(__dirname, 'app.json'), 'utf8'));
-assert.strictEqual(pkg.version, '1.0.11');
-assert.strictEqual(app.expo.version, '1.0.11');
-assert.strictEqual(app.expo.android.versionCode, 12);
+assert.deepStrictEqual(popupDecisionActions({ status: 'rejected' }), []);
+assert.deepStrictEqual(popupDecisionActions({ status: 'placed' }).map((a) => a.label).sort(), ['Accept', 'Reject'].sort());
 
-console.log('orderPopup 1.0.11 bill merge + single Accept ok');
+assert.strictEqual(pkg.version, '1.0.12');
+assert.strictEqual(app.expo.version, '1.0.12');
+assert.strictEqual(app.expo.android.versionCode, 13);
+
+console.log('orderPopup 1.0.12 rejected hides Accept/Reject ok');

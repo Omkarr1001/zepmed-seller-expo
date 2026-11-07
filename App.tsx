@@ -12,7 +12,7 @@ import { prepareOrderBell, startOrderBell, stopOrderBell } from './orderBell';
 import { listPairedPrinters, readSellerPrefs, writeSellerPrefs, type PairedPrinter } from './printerNative';
 import { setOrderWatchSound, silenceNativeOrder, startOrderWatch, stopOrderWatch } from './orderWatch';
 import { hydrateMutedOrderIds, isOrderMuted, muteOrder, subscribeMutedOrders, unmuteOrder } from './mutedOrders';
-import { hydrateRejectedOrders, mergeRejectedIntoOrders, rememberRejectedOrder } from './rejectedOrders';
+import { applyRejectedStatus, hydrateRejectedOrders, isOrderRejected, mergeRejectedIntoOrders, rememberRejectedOrder } from './rejectedOrders';
 import { hasCustomerRxDetails, parseCustomerRxDetails, type CustomerRxSource } from './customerRxDetails';
 import { mergeIncomingOrder, orderBillAmount, orderCustomerName, popupDecisionActions } from './orderPopup';
 import { orderIdFromNotificationData, orderStubFromNotificationData, registerSellerPush, SELLER_FCM_CHANNEL, SELLER_FCM_QUIET_CHANNEL, SELLER_FCM_SOUND } from './sellerPush';
@@ -538,6 +538,7 @@ function isRxPending(order: Pick<Order, 'order_type' | 'status'> & { is_prescrip
 
 function orderCanShowNewPopup(order: Order) {
   if (silencedOrderIds.has(order.id)) return false;
+  if (isOrderRejected(order.id) || ['rejected', 'cancelled'].includes(orderStatusKey(order.status))) return false;
   if (!pendingStatus(order.status)) return false;
   if (order.forwarded_to_me) return false;
   if (order.viewer_is_owner === false) return false;
@@ -613,6 +614,7 @@ function decisionActionMessage(code: string) {
 }
 
 function orderDecisionActions(order: Order) {
+  if (isOrderRejected(order.id) || ['rejected', 'cancelled'].includes(orderStatusKey(order.status))) return [];
   return popupDecisionActions(order);
 }
 
@@ -1419,7 +1421,17 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
 
   function rememberIncomingOrder(order: Order) {
     const prev = localOrderStubs.current.get(order.id) || ordersRef.current.find((item) => item.id === order.id);
-    const merged = mergeIncomingOrder(prev, order);
+    const merged = applyRejectedStatus(mergeIncomingOrder(prev, order));
+    if (isOrderRejected(merged.id)) {
+      localOrderStubs.current.delete(merged.id);
+      knownOrders.current.add(merged.id);
+      setOrders((list) => mergeRejectedIntoOrders(
+        list.some((item) => item.id === merged.id)
+          ? list.map((item) => item.id === merged.id ? merged : item)
+          : [merged, ...list],
+      ).map(applyRejectedStatus));
+      return merged;
+    }
     localOrderStubs.current.set(merged.id, merged);
     knownOrders.current.add(merged.id);
     setOrders((list) => (
@@ -1458,14 +1470,15 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
     let nextError = '';
     try {
       const loadOrders = async () => {
+        await hydrateRejectedOrders();
         const o = await sellerApi.orders();
         let next = (o.data?.items ?? []).sort((a, b) => (b.created_at ?? '').localeCompare(a.created_at ?? '') || b.id - a.id);
         next = next.map((order) => keepSellerAck(ordersRef.current.find((item) => item.id === order.id), order));
         for (const [id, stub] of localOrderStubs.current) {
-          if (next.some((order) => order.id === id)) localOrderStubs.current.delete(id);
+          if (isOrderRejected(id) || next.some((order) => order.id === id)) localOrderStubs.current.delete(id);
           else next = [stub, ...next];
         }
-        next = mergeRejectedIntoOrders(next);
+        next = mergeRejectedIntoOrders(next).map(applyRejectedStatus);
         const firstFresh = next.find((order) => !knownOrders.current.has(order.id) && orderCanShowNewPopup(order));
         const sessionAlreadyHydrated = knownOrders.current.size > 0;
         if (firstFresh && (sessionAlreadyHydrated || orderIsRecent(firstFresh))) {
@@ -1480,9 +1493,10 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
             else if (current.id === firstFresh.id) nextFresh = mergeIncomingOrder(current, firstFresh);
           }
           if (!nextFresh) return nextFresh;
-          const openFresh = nextFresh;
+          const openFresh = applyRejectedStatus(nextFresh);
+          if (isOrderRejected(openFresh.id) || ['rejected', 'cancelled'].includes(orderStatusKey(openFresh.status))) return null;
           const full = next.find((order) => order.id === openFresh.id);
-          return full ? mergeIncomingOrder(openFresh, full) : openFresh;
+          return full ? applyRejectedStatus(mergeIncomingOrder(openFresh, full)) : openFresh;
         });
         knownOrders.current = new Set(next.map((order) => order.id));
         setOrders(next);
@@ -1564,6 +1578,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
     registerOrderBackgroundTask().catch(() => undefined);
     void registerSellerFcm();
     const sub = Notifications.addNotificationResponseReceivedListener((response) => {
+      void hydrateRejectedOrders().then(() => {
       const data = (response.notification.request.content.data || {}) as Record<string, unknown>;
       const orderId = orderIdFromNotificationData(data) || Number(data.orderId || 0);
       const actionId = response.actionIdentifier;
@@ -1571,6 +1586,11 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
       const existing = ordersRef.current.find((item) => item.id === orderId);
       const incoming = stub ? mergeIncomingOrder(existing, stub as Order) : existing;
       const remembered = incoming ? rememberIncomingOrder(incoming) : incoming;
+      if (orderId && isOrderRejected(orderId)) {
+        openOrder(orderId, remembered);
+        void refresh(true, true);
+        return;
+      }
       if (orderId && actionId === 'accept') {
         const code = incoming && isPrescription(incoming) ? 'rx_accept' : 'confirmed';
         action(orderId, code).catch(() => openOrder(orderId, remembered));
@@ -1581,8 +1601,10 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
         openOrder(orderId, remembered);
       }
       void refresh(true, true);
+      });
     });
     const received = Notifications.addNotificationReceivedListener((notification) => {
+      void hydrateRejectedOrders().then(() => {
       const data = (notification.request.content.data || {}) as Record<string, unknown>;
       const stub = orderStubFromNotificationData(data);
       const existing = stub ? ordersRef.current.find((item) => item.id === stub.id) : undefined;
@@ -1593,9 +1615,10 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
           setFresh((current) => current?.id === remembered.id ? mergeIncomingOrder(current, remembered) : remembered);
         }
       }
-      if (incoming && !isOrderMuted(incoming.id)) void startOrderBell(true);
-      else if (stub && !isOrderMuted(stub.id)) void startOrderBell(true);
+      if (incoming && !isOrderRejected(incoming.id) && !isOrderMuted(incoming.id)) void startOrderBell(true);
+      else if (stub && !isOrderRejected(stub.id) && !isOrderMuted(stub.id)) void startOrderBell(true);
       void refresh(true, true);
+      });
     });
     const appSub = AppState.addEventListener('change', (state) => {
       if (state === 'active') {
@@ -1660,20 +1683,21 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
   }, [moreModule, refresh, selectedOrder, showReport, tab]);
 
   async function openOrder(id: number, seed?: Order | null) {
-    const local = seed || ordersRef.current.find((order) => order.id === id) || null;
+    const local = applyRejectedStatus((seed || ordersRef.current.find((order) => order.id === id) || { id, order_number: `Order #${id}`, status: 'placed', total_amount: 0 }) as Order);
     setSelectedOrder(withNearbyForward({
+      ...local,
       id,
-      order_number: local?.order_number || `Order #${id}`,
-      status: local?.status || 'placed',
-      total_amount: local?.total_amount || 0,
-      ...(local || {}),
+      order_number: local.order_number || `Order #${id}`,
+      status: isOrderRejected(id) ? 'rejected' : (local.status || 'placed'),
+      total_amount: local.total_amount || 0,
     } as OrderDetail));
     try {
       const detail = await sellerApi.orderDetail(id);
       if (detail.data) {
         localOrderStubs.current.delete(id);
-        setSelectedOrder(await ensureNearbyForward(detail.data));
-        rememberIncomingOrder(detail.data);
+        const next = applyRejectedStatus(detail.data);
+        setSelectedOrder(await ensureNearbyForward(next));
+        rememberIncomingOrder(next);
       }
     } catch (err) {
       Alert.alert('Order', errorMessage(err));
@@ -2981,7 +3005,7 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
   async function reload() {
     const res = await sellerApi.orderDetail(detail.id);
     if (res.data) {
-      const merged = keepSellerAck(detail, res.data);
+      const merged = applyRejectedStatus(keepSellerAck(detail, res.data));
       setDetail(await ensureNearbyForward(merged));
     }
   }
@@ -3231,9 +3255,10 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
     });
   }
 
-  const pending = pendingStatus(detail.status);
+  const pending = pendingStatus(detail.status) && !isOrderRejected(detail.id);
   const rx = detail.is_prescription_order || isPrescription(detail);
   const decisions = orderDecisionActions(detail);
+  const rejected = isOrderRejected(detail.id) || ['rejected', 'cancelled'].includes(orderStatusKey(detail.status));
   return (
     <View style={[s.screen, { paddingTop: insets.top }]}>
       <Header title={rx ? 'Prescription Order' : detail.order_number} subtitle={detail.status.replace(/_/g, ' ')} onRefresh={reload} onLogout={onBack} />
@@ -3252,7 +3277,7 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
             <Notice tone="success" title="Order accepted" body="Preparing, ready, fill and print stay on the seller web panel." />
           ) : !rx && !pending && ['confirmed', 'preparing'].includes(orderStatusKey(detail.status)) ? (
             <Notice tone="success" title="Order accepted" body="Preparing, ready, fill and print stay on the seller web panel." />
-          ) : orderStatusKey(detail.status) === 'rejected' || orderStatusKey(detail.status) === 'cancelled' ? (
+          ) : rejected ? (
             <Notice tone="error" title="Order rejected" body="" />
           ) : null}
           <CustomerRxDetailsCard source={detail} />
@@ -3603,7 +3628,8 @@ function NewOrderPopup({
   onClose: () => void;
   onAction: (code: string) => void;
 }) {
-  const decisions = order && !outcome ? popupDecisionActions(order) : [];
+  const rejected = Boolean(order && (isOrderRejected(order.id) || ['rejected', 'cancelled'].includes(String(order.status || '').toLowerCase()) || outcome === 'rejected'));
+  const decisions = order && !outcome && !rejected ? popupDecisionActions(order) : [];
   const rxLines = order ? parseCustomerRxDetails(order) : [];
   const bill = orderBillAmount(order);
   const who = orderCustomerName(order?.customer_name) || 'Customer';
@@ -3611,10 +3637,10 @@ function NewOrderPopup({
     <Modal visible={Boolean(order)} transparent animationType="fade" onRequestClose={onClose}>
       <View style={s.modalShade}>
         <ScrollView style={s.newOrderModal} contentContainerStyle={{ alignItems: 'stretch', gap: 12, paddingBottom: 28 }} keyboardShouldPersistTaps="handled">
-          {order && !outcome ? <SilenceBell orderId={order.id} /> : null}
+          {order && !outcome && !rejected ? <SilenceBell orderId={order.id} /> : null}
           <Image source={LOGO} style={[s.authLogo, { alignSelf: 'center' }]} resizeMode="contain" />
           <Text style={[s.newOrderTitle, { textAlign: 'center' }]}>
-            {outcome === 'accepted' ? 'Order accepted' : outcome === 'rejected' ? 'Order rejected' : 'New order received!'}
+            {outcome === 'accepted' ? 'Order accepted' : rejected ? 'Order rejected' : 'New order received!'}
           </Text>
           <Text style={[s.newOrderNo, { textAlign: 'center' }]}>{order?.order_number}</Text>
           <Text style={[s.newOrderBody, { textAlign: 'center' }]}>{who} • {bill ? money(bill) : 'Bill loading…'}</Text>
@@ -3629,16 +3655,20 @@ function NewOrderPopup({
               ))}
             </View>
           ) : null}
-          {!outcome ? <Text style={s.newOrderHint}>Tap the bell to silence this ring — same mute for prescription and normal orders.</Text> : null}
+          {!outcome && !rejected ? <Text style={s.newOrderHint}>Tap the bell to silence this ring — same mute for prescription and normal orders.</Text> : null}
           {decisions.map((a) => (
             a.code === 'rejected' || a.code === 'wrong_prescription'
               ? <Danger key={a.code} label={a.label} onPress={() => onAction(a.code)} />
               : <Primary key={a.code} label={a.label} onPress={() => onAction(a.code)} />
           ))}
-          <View>
-            <Secondary label="View" onPress={onOpen} />
-            <Text style={[s.newOrderHint, { marginTop: 8 }]} onPress={onClose}>Later</Text>
-          </View>
+          {rejected ? (
+            <Secondary label="Close" onPress={onClose} />
+          ) : (
+            <View>
+              <Secondary label="View" onPress={onOpen} />
+              <Text style={[s.newOrderHint, { marginTop: 8 }]} onPress={onClose}>Later</Text>
+            </View>
+          )}
         </ScrollView>
       </View>
     </Modal>

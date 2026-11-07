@@ -62,6 +62,7 @@ export function popupDecisionActions(order: {
   seller_confirmed_at?: string | null;
 }): Array<{ code: string; label: string }> {
   const status = String(order.status || '').toLowerCase();
+  if (['rejected', 'cancelled'].includes(status)) return [];
   const pending = ['placed', 'new', 'pending', 'prescription_review'].includes(status);
   if (!pending) return [];
   const rx = order.order_type === 'prescription'

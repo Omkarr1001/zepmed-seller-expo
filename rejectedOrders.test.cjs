@@ -59,6 +59,8 @@ assert.ok(src.includes("['rejected', 'Rejected']"));
 assert.ok(src.includes('mergeRejectedIntoOrders'));
 assert.ok(src.includes('rememberRejectedOrder'));
 assert.ok(src.includes('hydrateRejectedOrders'));
+assert.ok(src.includes('isOrderRejected'));
+assert.ok(src.includes('applyRejectedStatus'));
 assert.ok(src.includes('shouldPlaySound: !muted && !screenOff'));
 assert.ok(src.includes('FCM_QUIET_CHANNEL_KEY'));
 assert.ok(src.includes('refresh(empty ? false : true, true)'));
@@ -67,4 +69,5 @@ const bell = fs.readFileSync(path.join(__dirname, 'orderBell.ts'), 'utf8');
 assert.ok(bell.includes("AppState.currentState !== 'active'"));
 assert.ok(bell.includes('Vibration.vibrate([0, 400, 150, 400, 150, 500], false)'));
 
-console.log('rejected merge + screen-off sound gate ok');
+assert.ok(src.includes('await hydrateRejectedOrders()'));
+console.log('rejected merge + hide Accept/Reject/View after reject ok');
