@@ -15,7 +15,8 @@ import { hydrateMutedOrderIds, isOrderMuted, muteOrder, subscribeMutedOrders, un
 import { applyRejectedStatus, hydrateRejectedOrders, isOrderRejected, mergeRejectedIntoOrders, rememberRejectedOrder } from './rejectedOrders';
 import { hasCustomerRxDetails, parseCustomerRxDetails, type CustomerRxSource } from './customerRxDetails';
 import { mergeIncomingOrder, orderBillAmount, orderCustomerName, popupDecisionActions } from './orderPopup';
-import { orderIdFromNotificationData, orderStubFromNotificationData, registerSellerPush, SELLER_FCM_CHANNEL, SELLER_FCM_QUIET_CHANNEL, SELLER_FCM_SOUND } from './sellerPush';
+import { clearSellerFcmToken, orderIdFromNotificationData, orderIdFromSellerLink, orderStubFromNotificationData, readSellerFcmToken, registerSellerPush, sellerDeviceTokenBody, SELLER_FCM_CHANNEL, SELLER_FCM_QUIET_CHANNEL, SELLER_FCM_SOUND } from './sellerPush';
+import { dismissSellerRing, setSellerRingAppActive, setSellerRingSession, setSellerRingSound, showSellerOrderRing, subscribeSellerOrderRing } from './sellerRing';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -84,7 +85,6 @@ const APP_ICON = require('./assets/ic_launcher.png');
 const SESSION_KEY = 'zepmed:seller:session';
 const PENDING_NOTIFICATIONS_KEY = 'zepmed:seller:pending-notifications-v5';
 const NOTIF_RESET_KEY = 'zepmed:seller:notif-reset-v6';
-const FCM_QUIET_CHANNEL_KEY = 'zepmed:seller:fcm-channel-quiet-v1';
 const ORDER_POLL_TASK = 'zepmed-seller-order-poll';
 const ORDER_NOTIFICATION_CATEGORY = 'zepmed-seller-order-actions';
 const ORDER_CHANNEL = SELLER_FCM_CHANNEL;
@@ -108,16 +108,15 @@ Notifications.setNotificationHandler({
     const orderId = orderIdFromNotificationData(data);
     const leftoverRemind = /remind/i.test(identifier);
     const muted = leftoverRemind || (orderId > 0 && isOrderMuted(orderId));
-    const screenOff = AppState.currentState !== 'active';
     if (muted) {
       void stopOrderBell();
+      dismissSellerRing();
       void Notifications.cancelScheduledNotificationAsync(identifier).catch(() => undefined);
       void Notifications.dismissNotificationAsync(identifier).catch(() => undefined);
     }
     return {
       shouldShowAlert: !muted,
-      // Screen off / background: vibrate only — never play the order bell.
-      shouldPlaySound: !muted && !screenOff,
+      shouldPlaySound: !muted,
       // App icon badge = seller inbox unread only (not pending order count).
       shouldSetBadge: false,
       shouldShowBanner: !muted,
@@ -839,6 +838,7 @@ function orderNotificationIds(orderId: number) {
 
 async function cancelStoredNotificationIds(stored?: string) {
   if (!stored) return;
+  if (stored.includes('native-ring')) dismissSellerRing();
   await Promise.all(stored.split('|').map(async (id) => {
     await Notifications.cancelScheduledNotificationAsync(id).catch(() => undefined);
     await Notifications.dismissNotificationAsync(id).catch(() => undefined);
@@ -867,28 +867,24 @@ async function ensureNotificationReady() {
     if (Number(Platform.Version) >= 33) {
       await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS).catch(() => undefined);
     }
-    // Android 8+ will not change an existing channel's sound. Delete once so
-    // FCM default `zepmed-seller-orders` is vibrate-only when the screen is off.
-    if (!(await AsyncStorage.getItem(FCM_QUIET_CHANNEL_KEY))) {
+    // Android will not change an existing channel's sound. Drop the 1.0.11
+    // vibrate-only channel once so a killed-app order can ring.
+    await Notifications.deleteNotificationChannelAsync(ORDER_QUIET_CHANNEL).catch(() => undefined);
+    if (!(await AsyncStorage.getItem('zepmed:seller:fcm-channel-ring-v2'))) {
       await Notifications.deleteNotificationChannelAsync(ORDER_CHANNEL).catch(() => undefined);
       await Notifications.deleteNotificationChannelAsync('zepmed-order-bell-v4').catch(() => undefined);
-      await AsyncStorage.setItem(FCM_QUIET_CHANNEL_KEY, '1');
+      await AsyncStorage.setItem('zepmed:seller:fcm-channel-ring-v2', '1');
     }
-    const quietChannel = {
+    await Notifications.setNotificationChannelAsync(ORDER_CHANNEL, {
       name: 'ZepMed seller orders',
-      importance: Notifications.AndroidImportance.HIGH,
-      vibrationPattern: [0, 400, 150, 400, 150, 500],
-      sound: null as string | null,
+      importance: Notifications.AndroidImportance.MAX,
+      vibrationPattern: [0, 500, 200, 500, 200, 500],
+      sound: SELLER_FCM_SOUND,
       enableVibrate: true,
       enableLights: true,
       lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
       bypassDnd: true,
       showBadge: true,
-    };
-    await Notifications.setNotificationChannelAsync(ORDER_CHANNEL, quietChannel);
-    await Notifications.setNotificationChannelAsync(ORDER_QUIET_CHANNEL, {
-      ...quietChannel,
-      name: 'ZepMed seller orders (vibrate only)',
     });
   }
   await Notifications.setNotificationCategoryAsync(ORDER_NOTIFICATION_CATEGORY, [
@@ -927,7 +923,6 @@ async function cancelOrderLocalNotifications(orderId: number, stored?: string) {
 
 async function schedulePendingOrderNotification(order: Order, existing: Record<string, string>, force = false) {
   const key = String(order.id);
-  const ids = orderNotificationIds(order.id);
   if (isOrderMuted(order.id) || silencedOrderIds.has(order.id)) {
     await cancelOrderLocalNotifications(order.id, existing[key]);
     const next = { ...existing };
@@ -941,21 +936,22 @@ async function schedulePendingOrderNotification(order: Order, existing: Record<s
     await cancelLeftoverOrderReminds();
     return existing;
   }
-  const ok = await ensureNotificationReady();
-  if (!ok) return existing;
-  await cancelStoredNotificationIds(existing[key]);
-  await Notifications.cancelScheduledNotificationAsync(ids.remind).catch(() => undefined);
-  await Notifications.dismissNotificationAsync(ids.remind).catch(() => undefined);
-  await Notifications.scheduleNotificationAsync({
-    identifier: ids.now,
-    content: {
-      ...orderNotificationContent(order, true),
-      ...(Platform.OS === 'android' ? { channelId: ORDER_QUIET_CHANNEL } : {}),
-    },
-    trigger: null,
-  });
-  // Never schedule a repeating OS remind — FCM covers closed-app.
-  return { ...existing, [key]: ids.now };
+  // Killed/locked ringing is the data-only FCM full-screen path.
+  // Do not post a second quiet tray notification from the poll.
+  return existing;
+}
+
+function ringIncomingOrder(order: Order) {
+  if (isOrderMuted(order.id) || isOrderRejected(order.id)) {
+    dismissSellerRing();
+    void stopOrderBell();
+    return;
+  }
+  if (AppState.currentState === 'active') {
+    void startOrderBell(true);
+    return;
+  }
+  showSellerOrderRing(order);
 }
 
 async function syncInboxBadgeCount(explicitCount?: number) {
@@ -1006,6 +1002,8 @@ async function syncPendingOrderNotifications(orders: Order[], opts?: { forcePres
 
   if (!prefs.sound) {
     await stopOrderBell();
+    dismissSellerRing();
+    setSellerRingSound(false);
     await Promise.all(Object.values(next).map((id) => cancelStoredNotificationIds(id)));
     await writeNotificationMap({});
     // Do not clear app badge here — badge tracks inbox unread, not orders.
@@ -1014,6 +1012,7 @@ async function syncPendingOrderNotifications(orders: Order[], opts?: { forcePres
   }
 
   const ringingOrders = alertableOrders.filter((order) => !isOrderMuted(order.id));
+  setSellerRingSound(true);
   if (ringingOrders.length && appActive) await startOrderBell(true);
   else await stopOrderBell();
 
@@ -1042,6 +1041,7 @@ async function syncPendingOrderNotifications(orders: Order[], opts?: { forcePres
 async function cancelOrderNotification(orderId: number) {
   silenceOrderAlert(orderId);
   silenceNativeOrder(orderId);
+  dismissSellerRing();
   await stopOrderBell();
   const map = await readNotificationMap();
   await cancelOrderLocalNotifications(orderId, map[String(orderId)]);
@@ -1099,6 +1099,16 @@ const authApi = {
     await persistAuth(res.data);
   },
   async logout() {
+    setSellerRingSession(false);
+    dismissSellerRing();
+    await stopOrderBell();
+    await Notifications.dismissAllNotificationsAsync().catch(() => undefined);
+    await Notifications.cancelAllScheduledNotificationsAsync().catch(() => undefined);
+    const fcmToken = await readSellerFcmToken().catch(() => '');
+    if (fcmToken) {
+      await request<Record<string, unknown>>('seller/device-token', { body: sellerDeviceTokenBody(fcmToken, true) }).catch(() => undefined);
+      await clearSellerFcmToken().catch(() => undefined);
+    }
     const session = await readSession();
     if (session.refreshToken) {
       await request<Record<string, unknown>>('auth/logout', { auth: true, body: { refresh_token: session.refreshToken } }).catch(() => undefined);
@@ -1176,11 +1186,12 @@ const sellerApi = {
   subscriptionPlans: () => request<{ items?: SellerPlan[] | null }>('seller/subscription/plans'),
   subscriptionPreview: (planId: number) => request<SubscriptionPreview>('seller/subscription/preview', { query: { plan_id: planId, use_wallet: 1 } }),
   subscribePlan: (planId: number) => request<SubscriptionInfo>('seller/subscription/subscribe', { body: { plan_id: planId, payment_method: 'demo', demo_card: '4242 4242 4242 4242', simulate: 'success', use_wallet: 1 } }),
-  deviceToken: (body: { fcm_token: string; token: string; platform: string; device_type: string; device_name: string }) =>
-    request<{ saved?: number | null; platform?: string | null }>('seller/device-token', { body }),
+  deviceToken: (body: { fcm_token: string; token: string; platform: string; device_type: string; device_name: string; unbind?: number }) =>
+    request<{ saved?: number | null; unbound?: number | null; platform?: string | null }>('seller/device-token', { body }),
 };
 
 async function registerSellerFcm() {
+  setSellerRingSession(true);
   try {
     await registerSellerPush({
       ensureReady: ensureNotificationReady,
@@ -1257,9 +1268,12 @@ function SellerRoot() {
   useEffect(() => {
     readSession().then(async (s) => {
       if (s.accessToken) {
+        setSellerRingSession(true);
         try { await authApi.me(); setLoggedIn(true); }
         catch { setLoggedIn(Boolean(s.accessToken)); }
       } else {
+        setSellerRingSession(false);
+        dismissSellerRing();
         setLoggedIn(false);
       }
       setBooting(false);
@@ -1269,7 +1283,7 @@ function SellerRoot() {
   if (!splashDone) return <Splash />;
   if (booting) return <CenteredLoader />;
   if (!loggedIn) return <AuthScreen onDone={() => setLoggedIn(true)} />;
-  return <SellerShell onLogout={async () => { await stopOrderBell(); await stopOrderWatch(); await authApi.logout(); setLoggedIn(false); }} />;
+  return <SellerShell onLogout={async () => { await authApi.logout(); setLoggedIn(false); }} />;
 }
 
 function Splash() {
@@ -1412,12 +1426,14 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
   const localOrderStubs = useRef<Map<number, Order>>(new Map());
   const ordersRef = useRef<Order[]>([]);
   const dashRef = useRef<DashboardData | null>(null);
+  const freshRef = useRef<Order | null>(null);
   const refreshInFlight = useRef(false);
   const refreshQueued = useRef<'orders' | 'full' | false>(false);
   const lastOrdersPulse = useRef('');
   const tabHistory = useRef<TabKey[]>([]);
   ordersRef.current = orders;
   dashRef.current = dash;
+  freshRef.current = fresh;
 
   function rememberIncomingOrder(order: Order) {
     const prev = localOrderStubs.current.get(order.id) || ordersRef.current.find((item) => item.id === order.id);
@@ -1483,7 +1499,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
         const sessionAlreadyHydrated = knownOrders.current.size > 0;
         if (firstFresh && (sessionAlreadyHydrated || orderIsRecent(firstFresh))) {
           if (!knownOrders.current.has(firstFresh.id)) setPopupOutcome(null);
-          if (!isOrderMuted(firstFresh.id)) void startOrderBell(true);
+          if (!isOrderMuted(firstFresh.id)) ringIncomingOrder(firstFresh);
           else void stopOrderBell();
         }
         setFresh((current) => {
@@ -1553,6 +1569,8 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
 
   useEffect(() => {
     prepareOrderBell().catch(() => undefined);
+    setSellerRingAppActive(AppState.currentState === 'active');
+    readPrefs().then((prefs) => setSellerRingSound(prefs.sound)).catch(() => undefined);
   }, []);
 
   useEffect(() => {
@@ -1577,6 +1595,31 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
     }).catch(() => undefined);
     registerOrderBackgroundTask().catch(() => undefined);
     void registerSellerFcm();
+    const openFromLink = (url?: string | null) => {
+      const orderId = orderIdFromSellerLink(url);
+      if (!orderId) return;
+      dismissSellerRing();
+      openOrder(orderId);
+      void refresh(true, true);
+    };
+    Linking.getInitialURL().then(openFromLink).catch(() => undefined);
+    const linkSub = Linking.addEventListener('url', (event) => openFromLink(event.url));
+    const ringSub = subscribeSellerOrderRing((event) => {
+      const existing = ordersRef.current.find((item) => item.id === event.orderId);
+      const stub = orderStubFromNotificationData({
+        order_id: event.orderId,
+        title: event.title,
+        message: event.body,
+        customer_name: event.body.split('·')[0]?.trim(),
+      });
+      const incoming = stub ? mergeIncomingOrder(existing, stub as Order) : existing;
+      if (incoming && !isOrderRejected(incoming.id)) {
+        const remembered = rememberIncomingOrder(incoming);
+        if (orderCanShowNewPopup(remembered)) setFresh(remembered);
+        ringIncomingOrder(remembered);
+      }
+      void refresh(true, true);
+    });
     const sub = Notifications.addNotificationResponseReceivedListener((response) => {
       void hydrateRejectedOrders().then(() => {
       const data = (response.notification.request.content.data || {}) as Record<string, unknown>;
@@ -1615,19 +1658,24 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
           setFresh((current) => current?.id === remembered.id ? mergeIncomingOrder(current, remembered) : remembered);
         }
       }
-      if (incoming && !isOrderRejected(incoming.id) && !isOrderMuted(incoming.id)) void startOrderBell(true);
-      else if (stub && !isOrderRejected(stub.id) && !isOrderMuted(stub.id)) void startOrderBell(true);
+      if (incoming && !isOrderRejected(incoming.id) && !isOrderMuted(incoming.id)) ringIncomingOrder(incoming);
+      else if (stub && !isOrderRejected(stub.id) && !isOrderMuted(stub.id)) ringIncomingOrder(stub as Order);
       void refresh(true, true);
       });
     });
     const appSub = AppState.addEventListener('change', (state) => {
-      if (state === 'active') {
+      const active = state === 'active';
+      setSellerRingAppActive(active);
+      if (active) {
+        dismissSellerRing();
         readPrefs().then((prefs) => setOrderWatchSound(prefs.sound)).catch(() => undefined);
         const empty = !dashRef.current || !ordersRef.current.length;
         refresh(empty ? false : true, true);
         return;
       }
       setOrderWatchSound(false);
+      const current = freshRef.current;
+      if (current && orderCanShowNewPopup(current) && !isOrderMuted(current.id)) showSellerOrderRing(current);
       stopOrderBell();
       syncPendingOrderNotifications(ordersRef.current).catch(() => undefined);
     });
@@ -1638,6 +1686,8 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
       sub.remove();
       received.remove();
       appSub.remove();
+      linkSub.remove();
+      ringSub();
       muteSub();
     };
   }, [refresh]);
@@ -3466,7 +3516,11 @@ function SettingsPanel() {
     setAutoPrint(value.autoPrint);
     writeSellerPrefs(value).catch(() => undefined);
     setOrderWatchSound(value.sound);
-    if (!value.sound) syncPendingOrderNotifications([]).catch(() => undefined);
+    setSellerRingSound(value.sound);
+    if (!value.sound) {
+      dismissSellerRing();
+      syncPendingOrderNotifications([]).catch(() => undefined);
+    }
   }
   return (
     <>

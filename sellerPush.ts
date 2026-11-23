@@ -1,5 +1,8 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Notifications from 'expo-notifications';
 import { Platform } from 'react-native';
+
+export const SELLER_FCM_TOKEN_KEY = 'zepmed:seller:fcm-token';
 
 export const SELLER_FCM_CHANNEL = 'zepmed-seller-orders';
 export const SELLER_FCM_QUIET_CHANNEL = 'zepmed-seller-orders-quiet';
@@ -20,7 +23,35 @@ export function nativePushTokenFromDevice(device: { data?: unknown } | string | 
   return String(device.data || '').trim();
 }
 
-type DeviceTokenPoster = (body: { fcm_token: string; token: string; platform: string; device_type: string; device_name: string }) => Promise<unknown>;
+export type SellerDeviceTokenBody = {
+  fcm_token: string;
+  token: string;
+  platform: string;
+  device_type: string;
+  device_name: string;
+  unbind?: number;
+};
+
+export function sellerDeviceTokenBody(token: string, unbind = false): SellerDeviceTokenBody {
+  return {
+    fcm_token: token,
+    token,
+    platform: 'android',
+    device_type: 'android',
+    device_name: 'ZepMed Seller Expo',
+    ...(unbind ? { unbind: 1 } : {}),
+  };
+}
+
+export function orderIdFromSellerLink(url?: string | null): number {
+  if (!url) return 0;
+  const match = String(url).match(/order\/(\d+)/i);
+  if (!match) return 0;
+  const id = Number(match[1]);
+  return Number.isFinite(id) && id > 0 ? id : 0;
+}
+
+type DeviceTokenPoster = (body: SellerDeviceTokenBody) => Promise<unknown>;
 
 /**
  * Register the native FCM token (not ExpoPushToken) after login so killed-app
@@ -36,14 +67,17 @@ export async function registerSellerPush(opts: {
   const device = await Notifications.getDevicePushTokenAsync();
   const token = nativePushTokenFromDevice(device);
   if (isStubPushToken(token)) return null;
-  await opts.postDeviceToken({
-    fcm_token: token,
-    token,
-    platform: 'android',
-    device_type: 'android',
-    device_name: 'ZepMed Seller Expo',
-  });
+  await opts.postDeviceToken(sellerDeviceTokenBody(token, false));
+  await AsyncStorage.setItem(SELLER_FCM_TOKEN_KEY, token);
   return token;
+}
+
+export async function readSellerFcmToken(): Promise<string> {
+  return (await AsyncStorage.getItem(SELLER_FCM_TOKEN_KEY)) || '';
+}
+
+export async function clearSellerFcmToken() {
+  await AsyncStorage.removeItem(SELLER_FCM_TOKEN_KEY);
 }
 
 export function orderIdFromNotificationData(data?: Record<string, unknown> | null): number {

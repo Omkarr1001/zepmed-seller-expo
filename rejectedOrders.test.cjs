@@ -46,13 +46,12 @@ const alreadyCancelled = mergeRejectedSnaps(
 );
 assert.strictEqual(alreadyCancelled[0].status, 'cancelled');
 
-function screenOffShouldPlaySound(muted, appState) {
-  return !muted && appState === 'active';
+function screenOffRingsNatively(muted, loggedIn) {
+  return !muted && loggedIn;
 }
-assert.strictEqual(screenOffShouldPlaySound(false, 'active'), true);
-assert.strictEqual(screenOffShouldPlaySound(false, 'background'), false);
-assert.strictEqual(screenOffShouldPlaySound(false, 'inactive'), false);
-assert.strictEqual(screenOffShouldPlaySound(true, 'active'), false);
+assert.strictEqual(screenOffRingsNatively(false, true), true);
+assert.strictEqual(screenOffRingsNatively(true, true), false);
+assert.strictEqual(screenOffRingsNatively(false, false), false);
 
 const src = fs.readFileSync(path.join(__dirname, 'App.tsx'), 'utf8');
 assert.ok(src.includes("['rejected', 'Rejected']"));
@@ -61,13 +60,21 @@ assert.ok(src.includes('rememberRejectedOrder'));
 assert.ok(src.includes('hydrateRejectedOrders'));
 assert.ok(src.includes('isOrderRejected'));
 assert.ok(src.includes('applyRejectedStatus'));
-assert.ok(src.includes('shouldPlaySound: !muted && !screenOff'));
-assert.ok(src.includes('FCM_QUIET_CHANNEL_KEY'));
+assert.ok(src.includes('shouldPlaySound: !muted'));
+assert.ok(!src.includes('shouldPlaySound: !muted && !screenOff'));
+assert.ok(src.includes('setSellerRingSession(false)'));
+assert.ok(src.includes('sellerDeviceTokenBody(fcmToken, true)'));
 assert.ok(src.includes('refresh(empty ? false : true, true)'));
 assert.ok(!src.includes('if (!dash) return <CenteredLoader />'));
 const bell = fs.readFileSync(path.join(__dirname, 'orderBell.ts'), 'utf8');
 assert.ok(bell.includes("AppState.currentState !== 'active'"));
-assert.ok(bell.includes('Vibration.vibrate([0, 400, 150, 400, 150, 500], false)'));
+const notifier = fs.readFileSync(path.join(__dirname, 'native/order-ring/IncomingOrderNotifier.kt'), 'utf8');
+assert.ok(notifier.includes('setFullScreenIntent'));
+assert.ok(notifier.includes('isLooping = true'));
+assert.ok(notifier.includes('USAGE_NOTIFICATION_RINGTONE'));
+const fcm = fs.readFileSync(path.join(__dirname, 'native/order-ring/SellerFirebaseMessagingService.kt'), 'utf8');
+assert.ok(fcm.includes('new_order'));
+assert.ok(fcm.includes('isLoggedIn'));
 
 assert.ok(src.includes('await hydrateRejectedOrders()'));
 console.log('rejected merge + hide Accept/Reject/View after reject ok');

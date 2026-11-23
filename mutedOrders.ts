@@ -1,4 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { muteSellerOrder, syncSellerMutedIds, unmuteSellerOrder } from './sellerRing';
 
 export const MUTED_ORDER_IDS_KEY = 'muted_order_ids';
 
@@ -48,18 +49,21 @@ export async function hydrateMutedOrderIds() {
     // Keep whatever is already in memory.
   }
   notifyMuted();
+  syncSellerMutedIds(mutedOrderIdList());
   return mutedOrderIdList();
 }
 
 export async function muteOrder(orderId: number) {
   if (orderId <= 0) return;
   mutedOrderIds.add(orderId);
+  muteSellerOrder(orderId);
   await persistMuted();
   notifyMuted();
 }
 
 export async function unmuteOrder(orderId: number) {
   mutedOrderIds.delete(orderId);
+  unmuteSellerOrder(orderId);
   await persistMuted();
   notifyMuted();
 }

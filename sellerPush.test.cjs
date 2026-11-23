@@ -32,4 +32,28 @@ assert.strictEqual(orderIdFromNotificationData({ order_id: '2054' }), 2054);
 assert.strictEqual(orderIdFromNotificationData({ orderId: 88 }), 88);
 assert.strictEqual(orderIdFromNotificationData({}), 0);
 
+function orderIdFromSellerLink(url) {
+  if (!url) return 0;
+  const match = String(url).match(/order\/(\d+)/i);
+  if (!match) return 0;
+  const id = Number(match[1]);
+  return Number.isFinite(id) && id > 0 ? id : 0;
+}
+
+function sellerDeviceTokenBody(token, unbind = false) {
+  return {
+    fcm_token: token,
+    token,
+    platform: 'android',
+    device_type: 'android',
+    device_name: 'ZepMed Seller Expo',
+    ...(unbind ? { unbind: 1 } : {}),
+  };
+}
+
+assert.strictEqual(orderIdFromSellerLink('zepmedseller://order/2211'), 2211);
+assert.strictEqual(orderIdFromSellerLink('https://example.test/nope'), 0);
+assert.strictEqual(sellerDeviceTokenBody('abc', true).unbind, 1);
+assert.strictEqual(sellerDeviceTokenBody('abc').unbind, undefined);
+
 console.log('sellerPush stubs/FCM helpers ok');
