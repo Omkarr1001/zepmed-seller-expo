@@ -7,7 +7,7 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.media.AudioAttributes
-import android.media.MediaPlayer
+import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
 import android.os.Handler
@@ -19,7 +19,7 @@ import android.os.VibratorManager
 import androidx.core.app.NotificationCompat
 
 object IncomingOrderNotifier {
-  const val CHANNEL = "zepmed-seller-orders"
+  const val CHANNEL = "zepmed-seller-order-alert"
   const val NOTIFY_ID = 5104
   const val EXTRA_ORDER = "order_id"
   const val EXTRA_TITLE = "order_title"
@@ -31,12 +31,12 @@ object IncomingOrderNotifier {
   private const val KEY_LOGGED_IN = "logged_in"
   private const val KEY_SOUND = "sound_enabled"
   private const val KEY_MUTED = "muted_ids"
-  private const val KEY_CHANNEL = "channel_alert_v3"
+  private const val KEY_CHANNEL = "channel_alert_v4"
 
   @Volatile var appActive: Boolean = false
-  @Volatile private var player: MediaPlayer? = null
   @Volatile private var vibrator: Vibrator? = null
-  @Volatile private var wakeLock: PowerManager.WakeLock? = null
+  @Volatile private var screenLock: PowerManager.WakeLock? = null
+  @Volatile private var cpuLock: PowerManager.WakeLock? = null
   @Volatile private var generation: Int = 0
 
   fun isLoggedIn(ctx: Context): Boolean =
@@ -65,7 +65,6 @@ object IncomingOrderNotifier {
     val gen = ++generation
     ensureChannel(ctx)
     wake(ctx)
-    startOrderAlert(ctx, gen)
     vibrate(ctx)
 
     val full = Intent(ctx, IncomingOrderActivity::class.java).apply {
@@ -92,17 +91,20 @@ object IncomingOrderNotifier {
       Intent(ctx, IncomingOrderReceiver::class.java).setAction(ACTION_SILENCE).putExtra(EXTRA_ORDER, orderId),
       PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
     )
+    val sound = alertUri(ctx)
+    @Suppress("DEPRECATION")
     val builder = NotificationCompat.Builder(ctx, CHANNEL)
       .setSmallIcon(ctx.applicationInfo.icon)
       .setContentTitle(title)
       .setContentText(body)
-      .setCategory(NotificationCompat.CATEGORY_ALARM)
+      .setCategory(NotificationCompat.CATEGORY_CALL)
       .setPriority(NotificationCompat.PRIORITY_MAX)
       .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
       .setOngoing(true)
       .setAutoCancel(false)
-      .setVibrate(longArrayOf(0, 280, 120, 280))
-      .setSilent(true)
+      .setOnlyAlertOnce(false)
+      .setVibrate(longArrayOf(0, 400, 200, 400))
+      .setSound(sound, AudioManager.STREAM_RING)
       .setFullScreenIntent(fullPi, true)
       .setContentIntent(openPi)
       .addAction(0, "Silence", silenceAction)
@@ -110,7 +112,8 @@ object IncomingOrderNotifier {
       .setTimeoutAfter(90_000)
     val notification = builder.build()
     notification.flags = notification.flags or Notification.FLAG_NO_CLEAR
-    ctx.getSystemService(NotificationManager::class.java).notify(NOTIFY_ID, notification)
+    val nm = ctx.getSystemService(NotificationManager::class.java)
+    nm.notify(NOTIFY_ID, notification)
     Handler(Looper.getMainLooper()).postDelayed({
       if (generation == gen) dismiss(ctx.applicationContext)
     }, 90_000)
@@ -126,11 +129,9 @@ object IncomingOrderNotifier {
 
   fun dismiss(ctx: Context) {
     generation += 1
-    stopOrderAlert()
-    stopVibrate(ctx)
     try { ctx.getSystemService(NotificationManager::class.java).cancel(NOTIFY_ID) } catch (_: Exception) {}
-    try { wakeLock?.let { if (it.isHeld) it.release() } } catch (_: Exception) {}
-    wakeLock = null
+    stopVibrate(ctx)
+    releaseWake()
     try {
       ctx.sendBroadcast(Intent(ACTION_DISMISS).setPackage(ctx.packageName))
     } catch (_: Exception) {}
@@ -173,21 +174,16 @@ object IncomingOrderNotifier {
     val want = alertUri(ctx)
     val existing = nm.getNotificationChannel(CHANNEL)
     val wrongSound = existing != null && existing.sound != want
-    if (existing != null && !wrongSound && existing.importance >= NotificationManager.IMPORTANCE_HIGH) return
+    val wrongUsage = existing != null && existing.audioAttributes.usage != AudioAttributes.USAGE_NOTIFICATION_RINGTONE
+    if (existing != null && !wrongSound && !wrongUsage && existing.importance >= NotificationManager.IMPORTANCE_HIGH) return
     if (existing != null) nm.deleteNotificationChannel(CHANNEL)
-    val channel = NotificationChannel(CHANNEL, "ZepMed seller orders", NotificationManager.IMPORTANCE_HIGH).apply {
-      description = "Short order alert when a new order arrives, even if the app is closed"
+    val channel = NotificationChannel(CHANNEL, "ZepMed order alert", NotificationManager.IMPORTANCE_HIGH).apply {
+      description = "Plays the order bell once when a new order arrives, even if the phone is locked"
       enableVibration(true)
-      vibrationPattern = longArrayOf(0, 280, 120, 280)
+      vibrationPattern = longArrayOf(0, 400, 200, 400)
       lockscreenVisibility = Notification.VISIBILITY_PUBLIC
       setBypassDnd(true)
-      setSound(
-        want,
-        AudioAttributes.Builder()
-          .setUsage(AudioAttributes.USAGE_NOTIFICATION)
-          .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-          .build()
-      )
+      setSound(want, callStyleAudio())
     }
     nm.createNotificationChannel(channel)
   }
@@ -198,63 +194,39 @@ object IncomingOrderNotifier {
   private fun alertUri(ctx: Context): Uri =
     Uri.parse("android.resource://${ctx.packageName}/raw/order_bell")
 
-  private fun startOrderAlert(ctx: Context, gen: Int) {
-    stopOrderAlert()
-    try {
-      val mp = MediaPlayer()
-      mp.setAudioAttributes(
-        AudioAttributes.Builder()
-          .setUsage(AudioAttributes.USAGE_NOTIFICATION)
-          .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-          .build()
-      )
-      mp.setDataSource(ctx.applicationContext, alertUri(ctx))
-      mp.isLooping = false
-      mp.setOnCompletionListener {
-        if (player === it) {
-          it.release()
-          player = null
-        }
-      }
-      mp.setOnErrorListener { errored, _, _ ->
-        try { errored.release() } catch (_: Exception) {}
-        if (player === errored) player = null
-        true
-      }
-      mp.prepare()
-      if (generation != gen) {
-        mp.release()
-        return
-      }
-      mp.start()
-      player = mp
-    } catch (_: Exception) {}
-  }
-
-  private fun stopOrderAlert() {
-    val current = player
-    player = null
-    try {
-      current?.stop()
-      current?.release()
-    } catch (_: Exception) {}
-  }
+  private fun callStyleAudio(): AudioAttributes =
+    AudioAttributes.Builder()
+      .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+      .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+      .build()
 
   @Suppress("DEPRECATION")
   private fun wake(ctx: Context) {
     try {
       val pm = ctx.getSystemService(Context.POWER_SERVICE) as PowerManager
-      val flags = PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP
-      val lock = pm.newWakeLock(flags, "zepmed:incoming-order")
-      lock.acquire(45_000)
-      wakeLock = lock
+      val screen = pm.newWakeLock(
+        PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP or PowerManager.ON_AFTER_RELEASE,
+        "zepmed:incoming-order-screen"
+      )
+      screen.acquire(20_000)
+      screenLock = screen
+      val cpu = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "zepmed:incoming-order-cpu")
+      cpu.acquire(20_000)
+      cpuLock = cpu
     } catch (_: Exception) {}
+  }
+
+  private fun releaseWake() {
+    try { screenLock?.let { if (it.isHeld) it.release() } } catch (_: Exception) {}
+    try { cpuLock?.let { if (it.isHeld) it.release() } } catch (_: Exception) {}
+    screenLock = null
+    cpuLock = null
   }
 
   @Suppress("DEPRECATION")
   private fun vibrate(ctx: Context) {
     try {
-      val pattern = longArrayOf(0, 280, 120, 280, 120, 280)
+      val pattern = longArrayOf(0, 400, 200, 400)
       val device = if (Build.VERSION.SDK_INT >= 31) {
         ctx.getSystemService(VibratorManager::class.java).defaultVibrator
       } else {

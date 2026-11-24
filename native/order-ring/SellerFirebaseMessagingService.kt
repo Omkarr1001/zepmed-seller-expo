@@ -11,7 +11,7 @@ class SellerFirebaseMessagingService : FirebaseMessagingService() {
     val data = remoteMessage.data
     val action = data["action"].orEmpty()
     val channel = data["android_channel_id"].orEmpty()
-    if (action == "new_order" || channel == IncomingOrderNotifier.CHANNEL) {
+    if (action == "new_order" || channel == IncomingOrderNotifier.CHANNEL || channel == "zepmed-seller-orders") {
       val orderId = (data["order_id"] ?: data["orderId"] ?: "0").toIntOrNull() ?: 0
       if (!IncomingOrderNotifier.isLoggedIn(this) || !IncomingOrderNotifier.soundEnabled(this)) {
         IncomingOrderNotifier.dismiss(this)
