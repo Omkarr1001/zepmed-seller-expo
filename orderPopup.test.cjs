@@ -99,8 +99,8 @@ const app = JSON.parse(fs.readFileSync(path.join(__dirname, 'app.json'), 'utf8')
 assert.deepStrictEqual(popupDecisionActions({ status: 'rejected' }), []);
 assert.deepStrictEqual(popupDecisionActions({ status: 'placed' }).map((a) => a.label).sort(), ['Accept', 'Reject'].sort());
 
-assert.strictEqual(pkg.version, '1.0.13');
-assert.strictEqual(app.expo.version, '1.0.13');
-assert.strictEqual(app.expo.android.versionCode, 14);
+assert.strictEqual(pkg.version, '1.0.14');
+assert.strictEqual(app.expo.version, '1.0.14');
+assert.strictEqual(app.expo.android.versionCode, 15);
 
-console.log('orderPopup 1.0.13 rejected hides Accept/Reject ok');
+console.log('orderPopup 1.0.14 rejected hides Accept/Reject ok');

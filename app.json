@@ -2,7 +2,7 @@
   "expo": {
     "name": "ZepMed Seller",
     "slug": "zepmed-seller",
-    "version": "1.0.13",
+    "version": "1.0.14",
     "plugins": [
       "./plugins/withZepMedPrinter.js",
       "./plugins/withSellerFcm.js",
@@ -45,7 +45,7 @@
     "android": {
       "package": "com.zepmed.seller",
       "googleServicesFile": "./google-services.json",
-      "versionCode": 14,
+      "versionCode": 15,
       "adaptiveIcon": {
         "foregroundImage": "./assets/ic_launcher.png",
         "backgroundColor": "#0F766E"

@@ -7,8 +7,7 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.media.AudioAttributes
-import android.media.Ringtone
-import android.media.RingtoneManager
+import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Build
 import android.os.Handler
@@ -32,10 +31,10 @@ object IncomingOrderNotifier {
   private const val KEY_LOGGED_IN = "logged_in"
   private const val KEY_SOUND = "sound_enabled"
   private const val KEY_MUTED = "muted_ids"
-  private const val KEY_CHANNEL = "channel_ring_v2"
+  private const val KEY_CHANNEL = "channel_alert_v3"
 
   @Volatile var appActive: Boolean = false
-  @Volatile private var ringtone: Ringtone? = null
+  @Volatile private var player: MediaPlayer? = null
   @Volatile private var vibrator: Vibrator? = null
   @Volatile private var wakeLock: PowerManager.WakeLock? = null
   @Volatile private var generation: Int = 0
@@ -66,9 +65,8 @@ object IncomingOrderNotifier {
     val gen = ++generation
     ensureChannel(ctx)
     wake(ctx)
-    startRingtone(ctx)
+    startOrderAlert(ctx, gen)
     vibrate(ctx)
-    if (Build.VERSION.SDK_INT < 28) loopRingtone(ctx, gen)
 
     val full = Intent(ctx, IncomingOrderActivity::class.java).apply {
       flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
@@ -98,20 +96,20 @@ object IncomingOrderNotifier {
       .setSmallIcon(ctx.applicationInfo.icon)
       .setContentTitle(title)
       .setContentText(body)
-      .setCategory(NotificationCompat.CATEGORY_CALL)
+      .setCategory(NotificationCompat.CATEGORY_ALARM)
       .setPriority(NotificationCompat.PRIORITY_MAX)
       .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
       .setOngoing(true)
       .setAutoCancel(false)
-      .setVibrate(longArrayOf(0, 500, 200, 500, 200, 500))
-      .setSound(ringtoneUri())
+      .setVibrate(longArrayOf(0, 280, 120, 280))
+      .setSilent(true)
       .setFullScreenIntent(fullPi, true)
       .setContentIntent(openPi)
       .addAction(0, "Silence", silenceAction)
       .addAction(0, "Open", openAction)
       .setTimeoutAfter(90_000)
     val notification = builder.build()
-    notification.flags = notification.flags or Notification.FLAG_INSISTENT or Notification.FLAG_NO_CLEAR
+    notification.flags = notification.flags or Notification.FLAG_NO_CLEAR
     ctx.getSystemService(NotificationManager::class.java).notify(NOTIFY_ID, notification)
     Handler(Looper.getMainLooper()).postDelayed({
       if (generation == gen) dismiss(ctx.applicationContext)
@@ -128,8 +126,8 @@ object IncomingOrderNotifier {
 
   fun dismiss(ctx: Context) {
     generation += 1
-    stopRingtone()
-    stopVibrate()
+    stopOrderAlert()
+    stopVibrate(ctx)
     try { ctx.getSystemService(NotificationManager::class.java).cancel(NOTIFY_ID) } catch (_: Exception) {}
     try { wakeLock?.let { if (it.isHeld) it.release() } } catch (_: Exception) {}
     wakeLock = null
@@ -172,19 +170,21 @@ object IncomingOrderNotifier {
       nm.deleteNotificationChannel(CHANNEL)
       store.edit().putBoolean(KEY_CHANNEL, true).commit()
     }
+    val want = alertUri(ctx)
     val existing = nm.getNotificationChannel(CHANNEL)
-    if (existing != null && existing.importance >= NotificationManager.IMPORTANCE_HIGH && existing.sound != null) return
+    val wrongSound = existing != null && existing.sound != want
+    if (existing != null && !wrongSound && existing.importance >= NotificationManager.IMPORTANCE_HIGH) return
     if (existing != null) nm.deleteNotificationChannel(CHANNEL)
     val channel = NotificationChannel(CHANNEL, "ZepMed seller orders", NotificationManager.IMPORTANCE_HIGH).apply {
-      description = "Rings like a phone call when a new order arrives, even if the app is closed"
+      description = "Short order alert when a new order arrives, even if the app is closed"
       enableVibration(true)
-      vibrationPattern = longArrayOf(0, 500, 200, 500, 200, 500)
+      vibrationPattern = longArrayOf(0, 280, 120, 280)
       lockscreenVisibility = Notification.VISIBILITY_PUBLIC
       setBypassDnd(true)
       setSound(
-        ringtoneUri(),
+        want,
         AudioAttributes.Builder()
-          .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+          .setUsage(AudioAttributes.USAGE_NOTIFICATION)
           .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
           .build()
       )
@@ -195,39 +195,49 @@ object IncomingOrderNotifier {
   private fun prefs(ctx: Context) =
     ctx.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
-  private fun ringtoneUri(): Uri =
-    RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
-      ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+  private fun alertUri(ctx: Context): Uri =
+    Uri.parse("android.resource://${ctx.packageName}/raw/order_bell")
 
-  private fun startRingtone(ctx: Context) {
-    stopRingtone()
+  private fun startOrderAlert(ctx: Context, gen: Int) {
+    stopOrderAlert()
     try {
-      val tone = RingtoneManager.getRingtone(ctx.applicationContext, ringtoneUri()) ?: return
-      if (Build.VERSION.SDK_INT >= 21) {
-        tone.audioAttributes = AudioAttributes.Builder()
-          .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+      val mp = MediaPlayer()
+      mp.setAudioAttributes(
+        AudioAttributes.Builder()
+          .setUsage(AudioAttributes.USAGE_NOTIFICATION)
           .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
           .build()
+      )
+      mp.setDataSource(ctx.applicationContext, alertUri(ctx))
+      mp.isLooping = false
+      mp.setOnCompletionListener {
+        if (player === it) {
+          it.release()
+          player = null
+        }
       }
-      if (Build.VERSION.SDK_INT >= 28) tone.isLooping = true
-      tone.play()
-      ringtone = tone
+      mp.setOnErrorListener { errored, _, _ ->
+        try { errored.release() } catch (_: Exception) {}
+        if (player === errored) player = null
+        true
+      }
+      mp.prepare()
+      if (generation != gen) {
+        mp.release()
+        return
+      }
+      mp.start()
+      player = mp
     } catch (_: Exception) {}
   }
 
-  private fun loopRingtone(ctx: Context, gen: Int) {
-    Handler(Looper.getMainLooper()).postDelayed({
-      if (generation != gen) return@postDelayed
-      try {
-        if (ringtone?.isPlaying != true) startRingtone(ctx)
-      } catch (_: Exception) {}
-      loopRingtone(ctx, gen)
-    }, 2800)
-  }
-
-  private fun stopRingtone() {
-    try { ringtone?.stop() } catch (_: Exception) {}
-    ringtone = null
+  private fun stopOrderAlert() {
+    val current = player
+    player = null
+    try {
+      current?.stop()
+      current?.release()
+    } catch (_: Exception) {}
   }
 
   @Suppress("DEPRECATION")
@@ -244,20 +254,28 @@ object IncomingOrderNotifier {
   @Suppress("DEPRECATION")
   private fun vibrate(ctx: Context) {
     try {
-      val pattern = longArrayOf(0, 500, 200, 500, 200, 500)
+      val pattern = longArrayOf(0, 280, 120, 280, 120, 280)
       val device = if (Build.VERSION.SDK_INT >= 31) {
         ctx.getSystemService(VibratorManager::class.java).defaultVibrator
       } else {
         ctx.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
       }
       vibrator = device
-      if (Build.VERSION.SDK_INT >= 26) device.vibrate(VibrationEffect.createWaveform(pattern, 0))
-      else device.vibrate(pattern, 0)
+      if (Build.VERSION.SDK_INT >= 26) device.vibrate(VibrationEffect.createWaveform(pattern, -1))
+      else device.vibrate(pattern, -1)
     } catch (_: Exception) {}
   }
 
-  private fun stopVibrate() {
+  private fun stopVibrate(ctx: Context) {
     try { vibrator?.cancel() } catch (_: Exception) {}
     vibrator = null
+    try {
+      if (Build.VERSION.SDK_INT >= 31) {
+        ctx.getSystemService(VibratorManager::class.java).defaultVibrator.cancel()
+      } else {
+        @Suppress("DEPRECATION")
+        (ctx.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator).cancel()
+      }
+    } catch (_: Exception) {}
   }
 }

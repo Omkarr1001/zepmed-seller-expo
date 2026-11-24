@@ -559,6 +559,12 @@ function silenceOrderAlert(orderId: number) {
   silencedOrderIds.add(orderId);
 }
 
+function stopSellerAlertNow(orderId: number) {
+  silenceOrderAlert(orderId);
+  dismissSellerRing();
+  void stopOrderBell();
+}
+
 function forgetSettledSilenced(orders: Order[]) {
   for (const id of [...silencedOrderIds]) {
     const order = orders.find((item) => item.id === id);
@@ -1755,6 +1761,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
   }
 
   async function action(orderId: number, code: string) {
+    if (code === 'confirmed' || code === 'rx_accept') stopSellerAlertNow(orderId);
     try {
       const current = ordersRef.current.find((o) => o.id === orderId);
       if (code === 'ready_for_pickup') {
@@ -3089,6 +3096,7 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
   }
 
   async function run(code: string) {
+    if (code === 'confirmed' || code === 'rx_accept') stopSellerAlertNow(detail.id);
     setActing(true);
     try {
       if (code === 'ready_for_pickup') {
@@ -3167,6 +3175,7 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
   }
 
   async function process(finalStatus: string) {
+    if (finalStatus === 'confirmed') stopSellerAlertNow(detail.id);
     setActing(true);
     try {
       // Panel: Accept = process(confirmed); Ready = orders/action ONLY (never process ready —
