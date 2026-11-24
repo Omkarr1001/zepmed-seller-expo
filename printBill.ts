@@ -61,20 +61,21 @@ type BillRow = { text?: string; left?: string; right?: string; center?: boolean;
 const ESC_COLS = 32;
 const LABEL_DOTS = 384;
 const LABEL_MM = 48;
-const TSPL_COLS = 24;
+/** Match seller-panel bill-print.js / Milestone 523-L58P (22 cols @ 2x2). */
+const TSPL_COLS = 22;
 const TSPL_FONT = '1';
 const TSPL_XMUL = 2;
 const TSPL_YMUL = 2;
 const TSPL_CW = 16;
 const TSPL_LH = 28;
-const TSPL_LEFT = 0;
+const TSPL_LEFT = 8;
 const TITLE_XMUL = 3;
 const TITLE_YMUL = 3;
 const TITLE_CW = 24;
 const TITLE_LH = 42;
 const BODY_GLYPH_H = 24;
 const TITLE_GLYPH_H = 36;
-const ITEM_NAME_W = 12;
+const ITEM_NAME_W = 10;
 const ITEM_QTY_W = 4;
 const ITEM_AMT_W = 8;
 
@@ -205,7 +206,8 @@ function tsplText(x: number, y: number, text: string, xmul = TSPL_XMUL, ymul = T
   return `TEXT ${x},${y},"${TSPL_FONT}",0,${xmul},${ymul},"${tsplEscape(text).slice(0, maxChars)}"`;
 }
 
-function buildTspl(order: BillOrder, pharmacy?: BillPharmacy, paper = 'continuous') {
+/** Build TSPL payload + optional BACKUP trailing (Milestone feeds one extra blank page). */
+function buildTspl(order: BillOrder, pharmacy?: BillPharmacy, _paper = 'continuous'): { payload: string; reverseDots: number } {
   const rows = collectBillRows(order, pharmacy);
   const cmds: string[] = [];
   let y = 2;
@@ -229,33 +231,29 @@ function buildTspl(order: BillOrder, pharmacy?: BillPharmacy, paper = 'continuou
     lastInk = y + (title ? TITLE_GLYPH_H : BODY_GLYPH_H);
     y += title ? TITLE_LH : TSPL_LH;
   });
-  // Continuous roll has no gap/black mark. BLINE/GAP sensing and SET TEAR ON
-  // make Milestone keep feeding a blank “page” looking for a stop mark.
-  const heightMm = Math.max(12, Math.ceil(lastInk / 8) + (paper === 'gap' ? 1 : 2));
-  const setup = paper === 'gap'
-    ? [
-      `SIZE ${LABEL_MM} mm,${heightMm} mm`,
-      'GAP 2 mm,0 mm',
-      'SET TEAR ON',
-    ]
-    : [
-      `SIZE ${LABEL_MM} mm,${heightMm} mm`,
-      'GAP 0 mm,0 mm',
-      'OFFSET 0 mm',
-      'SET TEAR OFF',
-    ];
-  return [
-    ...setup,
+  // Same SIZE / DIRECTION / PRINT as seller-panel bill-print.js (works on Milestone 523-L58P).
+  // GAP/TEAR sensing is intentionally omitted — Milestone feeds one extra blank page after PRINT;
+  // we reverse that height with BACKUP/BACKFEED after the feed finishes.
+  const heightDots = Math.max(96, lastInk + 16);
+  const heightMm = Math.max(12, Math.ceil(heightDots / 8));
+  const reverseDots = heightMm * 8;
+  const payload = [
+    `SIZE ${LABEL_MM} mm,${heightMm} mm`,
+    'DIRECTION 0',
+    'REFERENCE 0,0',
     'SPEED 4',
     'DENSITY 10',
-    'DIRECTION 1,0',
-    'REFERENCE 0,0',
-    'SET PEEL OFF',
-    'SET CUTTER OFF',
     'CLS',
     ...cmds,
-    'PRINT 1,1',
+    'PRINT 1',
+    '',
   ].join('\r\n');
+  return { payload, reverseDots };
+}
+
+function buildTsplBackup(reverseDots: number) {
+  if (!reverseDots) return '';
+  return `BACKUP ${reverseDots}\r\nBACKFEED ${reverseDots}\r\nFEED 16\r\n`;
 }
 
 function concat(...chunks: Array<number[] | Uint8Array>) {
@@ -422,10 +420,13 @@ export async function printBill(order: BillOrder, layout: PrinterLayout = 'therm
   const mac = options?.mac || prefs.printerMac || '';
 
   if (layout === 'thermal_58' && mac) {
-    const payload = language === 'escpos' || language === 'esc/pos'
-      ? buildEscPos(order, pharmacy)
-      : textBytes(buildTspl(order, pharmacy, paper));
-    await printToBluetooth(mac, payload);
+    if (language === 'escpos' || language === 'esc/pos') {
+      await printToBluetooth(mac, buildEscPos(order, pharmacy));
+      return;
+    }
+    const { payload, reverseDots } = buildTspl(order, pharmacy, paper);
+    const trailing = textBytes(buildTsplBackup(reverseDots));
+    await printToBluetooth(mac, textBytes(payload), trailing);
     return;
   }
 

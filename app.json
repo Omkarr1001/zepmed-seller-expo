@@ -2,7 +2,24 @@
   "expo": {
     "name": "ZepMed Seller",
     "slug": "zepmed-seller",
-    "version": "1.0.0",
+    "version": "1.0.15",
+    "plugins": [
+      "./plugins/withZepMedPrinter.js",
+      "./plugins/withSellerFcm.js",
+      "./plugins/withSellerOrderRing.js",
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/ic_launcher.png",
+          "color": "#E2632E",
+          "sounds": [
+            "./assets/order_bell.mp3",
+            "./assets/bell.mp3"
+          ],
+          "defaultChannel": "zepmed-seller-orders"
+        }
+      ]
+    ],
     "orientation": "portrait",
     "icon": "./assets/ic_launcher.png",
     "userInterfaceStyle": "light",
@@ -27,7 +44,8 @@
     },
     "android": {
       "package": "com.zepmed.seller",
-      "versionCode": 1,
+      "googleServicesFile": "./google-services.json",
+      "versionCode": 16,
       "adaptiveIcon": {
         "foregroundImage": "./assets/ic_launcher.png",
         "backgroundColor": "#0F766E"
@@ -40,7 +58,12 @@
         "RECEIVE_BOOT_COMPLETED",
         "BLUETOOTH",
         "BLUETOOTH_ADMIN",
-        "BLUETOOTH_CONNECT"
+        "BLUETOOTH_CONNECT",
+        "BLUETOOTH_SCAN",
+        "USE_FULL_SCREEN_INTENT",
+        "WAKE_LOCK",
+        "TURN_SCREEN_ON",
+        "SHOW_WHEN_LOCKED"
       ]
     },
     "extra": {

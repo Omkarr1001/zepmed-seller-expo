@@ -3,8 +3,10 @@ node_modules/
 .expo-export-check/
 dist/
 build/
-android/
-ios/
+/android/
+/ios/
+# Keep local RN module native sources tracked
+!modules/**/android/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

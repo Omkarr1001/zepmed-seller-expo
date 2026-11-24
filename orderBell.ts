@@ -15,22 +15,34 @@ export async function prepareOrderBell() {
   });
 }
 
+/**
+ * Start looping bell + vibration for a new order.
+ * Safe to call from SellerShell poll while seller is on any tab.
+ */
 export async function startOrderBell(vibrate = true) {
   if (AppState.currentState !== 'active') return;
-  if (ringing) return;
+  if (ringing) {
+    // Do not restart the repeating vibrate pattern. Re-calling vibrate() here
+    // is what made Silence feel like it failed a few seconds later.
+    return;
+  }
   const mine = generation + 1;
   generation = mine;
   ringing = true;
   try {
+    if (vibrate) Vibration.vibrate([0, 280, 120, 280, 120, 280], false);
     await prepareOrderBell();
-    if (generation !== mine) return;
-    if (vibrate) Vibration.vibrate([0, 400, 150, 400, 150, 500], true);
+    if (generation !== mine) {
+      Vibration.cancel();
+      return;
+    }
     const created = await Audio.Sound.createAsync(require('./assets/bell.mp3'), {
       shouldPlay: true,
-      isLooping: true,
+      isLooping: false,
       volume: 1,
     });
     if (generation !== mine) {
+      Vibration.cancel();
       await created.sound.unloadAsync().catch(() => undefined);
       return;
     }
@@ -45,6 +57,7 @@ export async function stopOrderBell() {
   generation += 1;
   ringing = false;
   Vibration.cancel();
+  Vibration.cancel();
   if (sound) {
     const current = sound;
     sound = null;
@@ -55,6 +68,7 @@ export async function stopOrderBell() {
       // already released
     }
   }
+  Vibration.cancel();
 }
 
 export function isOrderBellRinging() {

@@ -1,0 +1,11 @@
+{
+  "name": "zepmed-printer",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "react-native": "index.js",
+  "peerDependencies": {
+    "react": "*",
+    "react-native": "*"
+  }
+}

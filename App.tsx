@@ -11,6 +11,12 @@ import { csvFromRows, printBill, shareBillPdf, type PrinterLayout } from './prin
 import { prepareOrderBell, startOrderBell, stopOrderBell } from './orderBell';
 import { listPairedPrinters, readSellerPrefs, writeSellerPrefs, type PairedPrinter } from './printerNative';
 import { setOrderWatchSound, silenceNativeOrder, startOrderWatch, stopOrderWatch } from './orderWatch';
+import { hydrateMutedOrderIds, isOrderMuted, muteOrder, subscribeMutedOrders, unmuteOrder } from './mutedOrders';
+import { applyRejectedStatus, hydrateRejectedOrders, isOrderRejected, mergeRejectedIntoOrders, rememberRejectedOrder } from './rejectedOrders';
+import { hasCustomerRxDetails, parseCustomerRxDetails, type CustomerRxSource } from './customerRxDetails';
+import { mergeIncomingOrder, orderBillAmount, orderCustomerName, popupDecisionActions } from './orderPopup';
+import { clearSellerFcmToken, orderIdFromNotificationData, orderIdFromSellerLink, orderStubFromNotificationData, readSellerFcmToken, registerSellerPush, sellerDeviceTokenBody, SELLER_FCM_CHANNEL, SELLER_FCM_QUIET_CHANNEL, SELLER_FCM_SOUND } from './sellerPush';
+import { dismissSellerRing, setSellerRingAppActive, setSellerRingSession, setSellerRingSound, showSellerOrderRing, subscribeSellerOrderRing } from './sellerRing';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -20,8 +26,10 @@ import {
   BackHandler,
   Easing,
   Image,
+  KeyboardAvoidingView,
   Linking,
   Modal,
+  PanResponder,
   PermissionsAndroid,
   Platform,
   Pressable,
@@ -33,7 +41,7 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
-  Vibration,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -75,12 +83,15 @@ const LOGO = require('./assets/zepmed_logo.jpg');
 const APP_ICON = require('./assets/ic_launcher.png');
 
 const SESSION_KEY = 'zepmed:seller:session';
-const PENDING_NOTIFICATIONS_KEY = 'zepmed:seller:pending-notifications-v4';
-const NOTIF_RESET_KEY = 'zepmed:seller:notif-reset-v4';
+const PENDING_NOTIFICATIONS_KEY = 'zepmed:seller:pending-notifications-v5';
+const NOTIF_RESET_KEY = 'zepmed:seller:notif-reset-v6';
 const ORDER_POLL_TASK = 'zepmed-seller-order-poll';
 const ORDER_NOTIFICATION_CATEGORY = 'zepmed-seller-order-actions';
-const ORDER_CHANNEL = 'zepmed-order-bell-v4';
+const ORDER_CHANNEL = SELLER_FCM_CHANNEL;
+const ORDER_QUIET_CHANNEL = SELLER_FCM_QUIET_CHANNEL;
 const silencedOrderIds = new Set<number>();
+/** Prevent double Ready POSTs — each ready_for_pickup clears delivery_agent_id and re-offers. */
+const readyInFlight = new Set<number>();
 const TAB_LOGOS: Record<TabKey, number> = {
   home: require('./assets/tab-home.png'),
   orders: require('./assets/tab-orders.png'),
@@ -90,14 +101,29 @@ const TAB_LOGOS: Record<TabKey, number> = {
 };
 
 Notifications.setNotificationHandler({
-  handleNotification: async () => ({
-    shouldShowAlert: true,
-    shouldPlaySound: true,
-    shouldSetBadge: true,
-    shouldShowBanner: true,
-    shouldShowList: true,
-    priority: Notifications.AndroidNotificationPriority.MAX,
-  }),
+  handleNotification: async (notification) => {
+    await hydrateMutedOrderIds();
+    const identifier = String(notification.request.identifier || '');
+    const data = (notification.request.content.data || {}) as Record<string, unknown>;
+    const orderId = orderIdFromNotificationData(data);
+    const leftoverRemind = /remind/i.test(identifier);
+    const muted = leftoverRemind || (orderId > 0 && isOrderMuted(orderId));
+    if (muted) {
+      void stopOrderBell();
+      dismissSellerRing();
+      void Notifications.cancelScheduledNotificationAsync(identifier).catch(() => undefined);
+      void Notifications.dismissNotificationAsync(identifier).catch(() => undefined);
+    }
+    return {
+      shouldShowAlert: !muted,
+      shouldPlaySound: !muted,
+      // App icon badge = seller inbox unread only (not pending order count).
+      shouldSetBadge: false,
+      shouldShowBanner: !muted,
+      shouldShowList: !muted,
+      priority: Notifications.AndroidNotificationPriority.MAX,
+    };
+  },
 });
 
 type ApiWrap<T> = { success: boolean; data?: T | null; message?: string | null };
@@ -151,6 +177,13 @@ type Order = {
   order_number: string;
   status: string;
   total_amount: number;
+  customer_payable?: number | null;
+  cod_collect_amount?: number | null;
+  grand_total?: number | null;
+  bill_total?: number | null;
+  amount?: number | null;
+  subtotal?: number | null;
+  seller_payout_amount?: number | null;
   customer_name?: string | null;
   address_line?: string | null;
   city?: string | null;
@@ -162,6 +195,7 @@ type Order = {
   accept_deadline_at?: string | null;
   fulfillment_status?: string | null;
   order_type?: string | null;
+  is_prescription_order?: boolean | null;
   routed_via?: string | null;
   seller_confirmed_at?: string | null;
   forwarded_to_me?: boolean | number | null;
@@ -173,6 +207,15 @@ type Order = {
   shop_order_discount?: number | null;
   virtual_shop_label?: string | null;
   routing_notes?: string | null;
+  notes?: string | null;
+  customer_notes?: string | null;
+  extra_details?: string | null;
+  extra_rx_details?: string | null;
+  requested_supply?: string | null;
+  doses?: string | null;
+  dosage?: string | null;
+  other_notes?: string | null;
+  other_instructions?: string | null;
 };
 type OrderLineItem = {
   id: number;
@@ -189,7 +232,7 @@ type OrderLineItem = {
   forwarded_to_me?: boolean | null;
   fulfilled_by_me?: boolean | null;
 };
-type ForwardPharmacy = { id: number; name?: string | null; city?: string | null; nearby_label?: string | null; distance_km?: number | null };
+type ForwardPharmacy = { id: number; name?: string | null; city?: string | null; nearby_label?: string | null; distance_km?: number | null; pincode?: string | null };
 type OrderDetail = Order & {
   customer_phone?: string | null;
   seller_notes?: string | null;
@@ -257,7 +300,7 @@ type DailySalesReport = {
 
 type TabKey = 'home' | 'orders' | 'catalog' | 'stock' | 'more';
 type AuthTab = 'password' | 'otp' | 'register';
-type OrderFilter = 'all' | 'pending' | 'rx' | 'preparing' | 'ready' | 'delivered';
+type OrderFilter = 'all' | 'pending' | 'rx' | 'preparing' | 'ready' | 'delivered' | 'rejected';
 type DashboardTarget = 'orders' | 'pending' | 'revenue' | 'delivered';
 type MoreModule = 'pharmacy' | 'settings' | 'notifications' | 'rx' | 'stock' | 'virtual' | 'payouts' | 'wholesale' | 'referral' | 'products' | 'subscription' | 'printer' | null;
 type ReportTab = 'items' | 'orders' | 'rx' | 'virtual' | 'wallet';
@@ -276,8 +319,38 @@ type SellerSettings = {
   auto_active_now?: boolean | number;
   pharmacy?: PharmacyInfo | null;
 };
-type SellerNotification = { id: number; title?: string | null; message?: string | null; body?: string | null; is_read?: number | boolean | null; created_at?: string | null; category?: string | null; type?: string | null };
-type RxRequest = { id: number; customer_name?: string | null; customer_phone?: string | null; status?: string | null; prescription_url?: string | null; created_at?: string | null; notes?: string | null; request_number?: string | null; message?: string | null };
+type SellerNotification = {
+  id: number;
+  title?: string | null;
+  message?: string | null;
+  body?: string | null;
+  is_read?: number | boolean | string | null;
+  read_at?: string | null;
+  created_at?: string | null;
+  category?: string | null;
+  type?: string | null;
+  action?: string | null;
+  product_id?: number | null;
+  meta?: { action?: string | null; status?: string | null; approval_status?: string | null; product_id?: number | null; [key: string]: unknown } | null;
+};
+type NotifFilter = 'all' | 'approved' | 'rejected';
+type RxRequest = {
+  id: number;
+  customer_name?: string | null;
+  customer_phone?: string | null;
+  status?: string | null;
+  prescription_url?: string | null;
+  created_at?: string | null;
+  notes?: string | null;
+  seller_notes?: string | null;
+  request_number?: string | null;
+  message?: string | null;
+  extra_details?: string | null;
+  extra_rx_details?: string | null;
+  requested_supply?: string | null;
+  doses?: string | null;
+  other_notes?: string | null;
+};
 type DiscountRule = {
   id: number;
   name?: string | null;
@@ -370,8 +443,10 @@ function prettyDate(raw?: string | null) {
   return raw.slice(0, 16).replace('T', ' ');
 }
 
-function isPrescription(order: Pick<Order, 'order_type'>) {
-  return order.order_type === 'prescription';
+function isPrescription(order: Pick<Order, 'order_type' | 'status'> & { is_prescription_order?: boolean | null }) {
+  return order.order_type === 'prescription'
+    || order.is_prescription_order === true
+    || (order.status ?? '').toLowerCase() === 'prescription_review';
 }
 
 function isVirtualShop(order: Pick<Order, 'is_virtual_shop_order' | 'routed_via'>) {
@@ -394,14 +469,23 @@ function statusTone(status?: string | null) {
     case 'placed':
     case 'new':
     case 'pending':
-      return { bg: C.yellowSoft, fg: C.yellow, label: 'New' };
+      return { bg: C.yellowSoft, fg: C.yellow, label: 'Pending' };
     case 'prescription_review':
       return { bg: C.purpleSoft, fg: C.purple, label: 'Prescription' };
     case 'confirmed':
+      return { bg: C.blueSoft, fg: C.blue, label: 'Confirmed' };
     case 'preparing':
-      return { bg: C.blueSoft, fg: C.blue, label: (status ?? '').replace(/_/g, ' ') };
+      return { bg: C.blueSoft, fg: C.blue, label: 'Preparing' };
+    case 'partial_forward':
+      return { bg: C.blueSoft, fg: C.blue, label: 'Partial forward' };
     case 'ready_for_pickup':
-      return { bg: C.greenSoft, fg: C.green, label: 'Ready' };
+      return { bg: C.greenSoft, fg: C.green, label: 'Ready to Pick Up' };
+    case 'assigned':
+      return { bg: C.greenSoft, fg: C.green, label: 'Assigned' };
+    case 'picked_up':
+      return { bg: C.blueSoft, fg: C.blue, label: 'Picked up' };
+    case 'out_for_delivery':
+      return { bg: C.blueSoft, fg: C.blue, label: 'Out for delivery' };
     case 'delivered':
     case 'completed':
       return { bg: C.greenSoft, fg: C.green, label: 'Delivered' };
@@ -417,17 +501,56 @@ function pendingStatus(status?: string | null) {
   return ['placed', 'new', 'pending', 'prescription_review'].includes((status ?? '').toLowerCase());
 }
 
+function hasSellerConfirmedAt(value?: string | null) {
+  const v = String(value || '').trim();
+  return v !== '' && v !== '0000-00-00 00:00:00' && v.toLowerCase() !== 'null';
+}
+
+function keepSellerAck<T extends { id: number; seller_confirmed_at?: string | null }>(prev: T | undefined, next: T): T {
+  if (hasSellerConfirmedAt(next.seller_confirmed_at) || !hasSellerConfirmedAt(prev?.seller_confirmed_at)) return next;
+  return { ...next, seller_confirmed_at: prev?.seller_confirmed_at };
+}
+
+function rejectedLocalOrder(order: Partial<Order> | null | undefined, orderId: number): Order {
+  return {
+    id: orderId,
+    order_number: String(order?.order_number || `Order #${orderId}`),
+    status: 'rejected',
+    total_amount: Number(order?.total_amount || 0) || 0,
+    customer_name: order?.customer_name ?? null,
+    created_at: order?.created_at ?? new Date().toISOString(),
+    payment_method: order?.payment_method ?? null,
+    address_line: order?.address_line ?? null,
+    city: order?.city ?? null,
+    pincode: order?.pincode ?? null,
+    order_type: order?.order_type ?? null,
+    is_prescription_order: order?.is_prescription_order ?? null,
+  };
+}
+
+function isRxPending(order: Pick<Order, 'order_type' | 'status'> & { is_prescription_order?: boolean | null }) {
+  const rx = order.order_type === 'prescription'
+    || order.is_prescription_order === true
+    || (order.status ?? '').toLowerCase() === 'prescription_review';
+  return rx && pendingStatus(order.status);
+}
+
 function orderCanShowNewPopup(order: Order) {
   if (silencedOrderIds.has(order.id)) return false;
+  if (isOrderRejected(order.id) || ['rejected', 'cancelled'].includes(orderStatusKey(order.status))) return false;
   if (!pendingStatus(order.status)) return false;
-  if (order.seller_confirmed_at) return false;
   if (order.forwarded_to_me) return false;
   if (order.viewer_is_owner === false) return false;
-  if (order.accept_seconds_remaining != null) return Number(order.accept_seconds_remaining) > 0;
-  if (order.accept_deadline_at) {
-    const normalized = order.accept_deadline_at.includes('T') ? order.accept_deadline_at : order.accept_deadline_at.replace(' ', 'T');
-    const deadline = new Date(normalized).getTime();
-    if (!Number.isNaN(deadline)) return deadline > Date.now();
+  // App Accept (rx_accept / confirmed) sets seller_confirmed_at and must
+  // stop the ring even while Rx stays in prescription_review for fill on panel.
+  if (order.seller_confirmed_at) return false;
+  if (!isRxPending(order)) {
+    if (order.accept_seconds_remaining != null) return Number(order.accept_seconds_remaining) > 0;
+    if (order.accept_deadline_at) {
+      const normalized = order.accept_deadline_at.includes('T') ? order.accept_deadline_at : order.accept_deadline_at.replace(' ', 'T');
+      const deadline = new Date(normalized).getTime();
+      if (!Number.isNaN(deadline)) return deadline > Date.now();
+    }
   }
   return true;
 }
@@ -436,26 +559,110 @@ function silenceOrderAlert(orderId: number) {
   silencedOrderIds.add(orderId);
 }
 
+function stopSellerAlertNow(orderId: number) {
+  silenceOrderAlert(orderId);
+  dismissSellerRing();
+  void stopOrderBell();
+}
+
 function forgetSettledSilenced(orders: Order[]) {
   for (const id of [...silencedOrderIds]) {
     const order = orders.find((item) => item.id === id);
-    if (!order || !pendingStatus(order.status) || order.seller_confirmed_at) silencedOrderIds.delete(id);
+    if (!order || !pendingStatus(order.status) || (!isRxPending(order) && order.seller_confirmed_at)) silencedOrderIds.delete(id);
   }
 }
 
-function quickActions(status: string) {
-  const s = status.toLowerCase();
-  if (s === 'confirmed') return [{ code: 'preparing', label: 'Preparing' }, { code: 'ready_for_pickup', label: 'Ready' }];
-  if (s === 'preparing') return [{ code: 'ready_for_pickup', label: 'Ready' }];
-  return [];
+function withNearbyForward(order: OrderDetail): OrderDetail {
+  return order;
+}
+
+function rxSelectionLineNumbers(notes?: string | null): number[] {
+  const match = String(notes || '').match(/\[RX_SELECTIONS\]([\s\S]*?)\[\/RX_SELECTIONS\]/);
+  if (!match) return [];
+  try {
+    const lines = JSON.parse(match[1]) as Array<{ mode?: string; line_number?: number }>;
+    return (lines || []).filter((line) => (line.mode || '') !== 'skip').map((line) => Number(line.line_number)).filter((n) => n > 0);
+  } catch {
+    return [];
+  }
+}
+
+function orderIsRecent(order: Order, maxAgeMs = 2 * 60 * 60 * 1000) {
+  const created = Date.parse(String(order.created_at || '').replace(' ', 'T'));
+  if (!Number.isFinite(created) || created <= 0) return true;
+  return Date.now() - created <= maxAgeMs;
+}
+
+function orderStatusKey(status?: string | null) {
+  return (status ?? '').toLowerCase().trim();
+}
+
+/** Live panel orderCanMarkReady — only confirmed/preparing may go Ready (once). */
+function orderCanMarkReady(status?: string | null) {
+  return ['confirmed', 'preparing', 'partial_forward'].includes(orderStatusKey(status));
+}
+
+function orderAlreadyReadyOrPast(status?: string | null) {
+  return ['ready_for_pickup', 'assigned', 'picked_up', 'out_for_delivery', 'delivered', 'completed'].includes(orderStatusKey(status));
+}
+
+function quickActions(_status: string) {
+  // Seller app is accept/reject only. Preparing / Ready stay on the seller panel.
+  return [] as Array<{ code: string; label: string }>;
+}
+
+function decisionActionMessage(code: string) {
+  if (code === 'rejected') return 'Rejected by pharmacy';
+  if (code === 'wrong_prescription') return 'Wrong prescription';
+  if (['confirmed', 'preparing', 'cancelled'].includes(code)) return readyActionMessage(code);
+  return undefined;
+}
+
+function orderDecisionActions(order: Order) {
+  if (isOrderRejected(order.id) || ['rejected', 'cancelled'].includes(orderStatusKey(order.status))) return [];
+  return popupDecisionActions(order);
+}
+
+/** Live panel marks ready via POST seller/orders/action (triggers exclusive delivery offer). */
+function readyActionMessage(action: string) {
+  return `Status updated — ${action.replace(/_/g, ' ')}`;
+}
+
+/**
+ * Single Ready call matching live seller panel updateOrderStatusOnly('ready_for_pickup').
+ * Never re-POST ready — server clears delivery_agent_id and re-offers on every ready_for_pickup.
+ */
+async function markOrderReadyOnce(orderId: number, currentStatus?: string | null) {
+  if (orderAlreadyReadyOrPast(currentStatus)) {
+    return { skipped: true as const, data: { order_id: orderId, status: orderStatusKey(currentStatus) || 'ready_for_pickup' } };
+  }
+  if (!orderCanMarkReady(currentStatus) && currentStatus) {
+    throw new Error(orderAlreadyReadyOrPast(currentStatus) ? 'Order is already ready' : 'Accept the order first, then mark Ready');
+  }
+  if (readyInFlight.has(orderId)) {
+    throw new Error('Ready already in progress — wait a moment');
+  }
+  readyInFlight.add(orderId);
+  try {
+    const res = await sellerApi.orderAction(orderId, 'ready_for_pickup', readyActionMessage('ready_for_pickup'));
+    return { skipped: false as const, data: res.data ?? { order_id: orderId, status: 'ready_for_pickup' }, auto_assigned: res.data?.auto_assigned };
+  } finally {
+    // Keep lock briefly so double-taps / remounts cannot re-fire before status refresh.
+    setTimeout(() => readyInFlight.delete(orderId), 4000);
+  }
 }
 
 function orderCardActions(order: Order) {
-  if (pendingStatus(order.status)) {
-    if (isPrescription(order)) return order.seller_confirmed_at ? [] : [{ code: 'rx_accept', label: 'Accept' }];
-    return [{ code: 'confirmed', label: 'Accept' }];
-  }
-  return quickActions(order.status);
+  return orderDecisionActions(order);
+}
+
+function useLayoutScale() {
+  const { width, height } = useWindowDimensions();
+  const short = Math.min(width, height) < 360;
+  const narrow = width < 380;
+  const pad = narrow ? 12 : 18;
+  const tabReserve = 96 + (Platform.OS === 'ios' ? 8 : 0);
+  return { width, height, short, narrow, pad, tabReserve };
 }
 
 function mediaUrl(path?: string | null) {
@@ -514,6 +721,7 @@ async function persistAuth(data: AuthSession) {
   });
   const prefs = await readPrefs();
   startOrderWatch(data.access_token, data.refresh_token || current.refreshToken, prefs.sound);
+  void registerSellerFcm();
 }
 
 async function refreshAccessToken() {
@@ -543,7 +751,14 @@ async function ensureFreshToken() {
 
 async function request<T>(
   path: string,
-  options: { auth?: boolean; method?: 'GET' | 'POST'; body?: unknown; query?: Record<string, string | number | boolean | null | undefined>; retry?: boolean } = {},
+  options: {
+    auth?: boolean;
+    method?: 'GET' | 'POST';
+    body?: unknown;
+    query?: Record<string, string | number | boolean | null | undefined>;
+    retry?: boolean;
+    timeoutMs?: number;
+  } = {},
 ): Promise<ApiWrap<T>> {
   const params = new URLSearchParams();
   Object.entries(options.query ?? {}).forEach(([k, v]) => {
@@ -557,12 +772,13 @@ async function request<T>(
   const bases = options.auth
     ? [API.authBaseUrl, API.authFallbackBaseUrl, API.authLegacyBaseUrl]
     : [API.phpBaseUrl, API.phpFallbackBaseUrl];
+  const timeoutMs = options.timeoutMs ?? (options.auth ? 12000 : 10000);
   let lastError: unknown;
 
   for (let idx = 0; idx < bases.length; idx += 1) {
     const url = `${bases[idx]}/${path.replace(/^\/+/, '')}${params.toString() ? `?${params}` : ''}`;
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 18000);
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
     let response: Response;
     try {
       response = await fetch(url, {
@@ -573,6 +789,9 @@ async function request<T>(
       });
     } catch (err) {
       lastError = err;
+      // Abort/timeout must not walk api.zepmed.org → zepmed.org. That doubled each
+      // call to ~36s and made tapped orders appear 1–2 minutes later.
+      if (isAbortError(err)) break;
       if (idx < bases.length - 1) continue;
       throw err;
     } finally {
@@ -625,9 +844,21 @@ function orderNotificationIds(orderId: number) {
 
 async function cancelStoredNotificationIds(stored?: string) {
   if (!stored) return;
+  if (stored.includes('native-ring')) dismissSellerRing();
   await Promise.all(stored.split('|').map(async (id) => {
     await Notifications.cancelScheduledNotificationAsync(id).catch(() => undefined);
     await Notifications.dismissNotificationAsync(id).catch(() => undefined);
+  }));
+}
+
+async function cancelLeftoverOrderReminds() {
+  const scheduled = await Notifications.getAllScheduledNotificationsAsync().catch(() => []);
+  await Promise.all((scheduled || []).map(async (item) => {
+    const id = String(item.identifier || '');
+    if (/remind/i.test(id) || id.startsWith('zepmed-order-remind-')) {
+      await Notifications.cancelScheduledNotificationAsync(id).catch(() => undefined);
+      await Notifications.dismissNotificationAsync(id).catch(() => undefined);
+    }
   }));
 }
 
@@ -637,15 +868,24 @@ async function ensureNotificationReady() {
     await Notifications.dismissAllNotificationsAsync().catch(() => undefined);
     await AsyncStorage.setItem(NOTIF_RESET_KEY, '1');
   }
+  await cancelLeftoverOrderReminds();
   if (Platform.OS === 'android') {
     if (Number(Platform.Version) >= 33) {
       await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS).catch(() => undefined);
     }
+    // Android will not change an existing channel's sound. Drop the 1.0.11
+    // vibrate-only channel once so a killed-app order can ring.
+    await Notifications.deleteNotificationChannelAsync(ORDER_QUIET_CHANNEL).catch(() => undefined);
+    if (!(await AsyncStorage.getItem('zepmed:seller:fcm-channel-ring-v2'))) {
+      await Notifications.deleteNotificationChannelAsync(ORDER_CHANNEL).catch(() => undefined);
+      await Notifications.deleteNotificationChannelAsync('zepmed-order-bell-v4').catch(() => undefined);
+      await AsyncStorage.setItem('zepmed:seller:fcm-channel-ring-v2', '1');
+    }
     await Notifications.setNotificationChannelAsync(ORDER_CHANNEL, {
-      name: 'ZepMed new orders',
+      name: 'ZepMed seller orders',
       importance: Notifications.AndroidImportance.MAX,
-      vibrationPattern: [0, 400, 150, 400, 150, 500],
-      sound: 'bell',
+      vibrationPattern: [0, 500, 200, 500, 200, 500],
+      sound: SELLER_FCM_SOUND,
       enableVibrate: true,
       enableLights: true,
       lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
@@ -665,11 +905,11 @@ async function ensureNotificationReady() {
   return true;
 }
 
-function orderNotificationContent(order: Order) {
+function orderNotificationContent(order: Order, quiet = false) {
   return {
     title: `New order ${order.order_number || ''}`.trim(),
-    body: `${order.customer_name || 'Customer'} • ${money(order.total_amount)}. Tap to open and accept.`,
-    sound: 'bell',
+    body: `${orderCustomerName(order.customer_name) || 'Customer'} • ${money(orderBillAmount(order) || order.total_amount)}. Tap to open and accept.`,
+    sound: quiet ? false : SELLER_FCM_SOUND,
     data: { orderId: order.id },
     categoryIdentifier: ORDER_NOTIFICATION_CATEGORY,
     sticky: true,
@@ -678,24 +918,83 @@ function orderNotificationContent(order: Order) {
   };
 }
 
+async function cancelOrderLocalNotifications(orderId: number, stored?: string) {
+  const ids = orderNotificationIds(orderId);
+  await cancelStoredNotificationIds(stored);
+  await Notifications.cancelScheduledNotificationAsync(ids.now).catch(() => undefined);
+  await Notifications.cancelScheduledNotificationAsync(ids.remind).catch(() => undefined);
+  await Notifications.dismissNotificationAsync(ids.now).catch(() => undefined);
+  await Notifications.dismissNotificationAsync(ids.remind).catch(() => undefined);
+}
+
 async function schedulePendingOrderNotification(order: Order, existing: Record<string, string>, force = false) {
   const key = String(order.id);
-  const ids = orderNotificationIds(order.id);
+  if (isOrderMuted(order.id) || silencedOrderIds.has(order.id)) {
+    await cancelOrderLocalNotifications(order.id, existing[key]);
+    const next = { ...existing };
+    delete next[key];
+    return next;
+  }
   if (existing[key] && !force) return existing;
-  const ok = await ensureNotificationReady();
-  if (!ok) return existing;
-  await cancelStoredNotificationIds(existing[key]);
-  await Notifications.scheduleNotificationAsync({
-    identifier: ids.now,
-    content: orderNotificationContent(order),
-    trigger: null,
-  });
-  await Notifications.scheduleNotificationAsync({
-    identifier: ids.remind,
-    content: orderNotificationContent(order),
-    trigger: { seconds: 60, repeats: true, channelId: ORDER_CHANNEL } as Notifications.NotificationTriggerInput,
-  });
-  return { ...existing, [key]: `${ids.now}|${ids.remind}` };
+  // Foreground uses the in-app looping bell. Presenting an OS notification
+  // here (or a 60s remind) is what re-rang / re-vibrated after Silence.
+  if (AppState.currentState === 'active') {
+    await cancelLeftoverOrderReminds();
+    return existing;
+  }
+  // Killed/locked ringing is the data-only FCM full-screen path.
+  // Do not post a second quiet tray notification from the poll.
+  return existing;
+}
+
+function ringIncomingOrder(order: Order) {
+  if (isOrderMuted(order.id) || isOrderRejected(order.id)) {
+    dismissSellerRing();
+    void stopOrderBell();
+    return;
+  }
+  if (AppState.currentState === 'active') {
+    void startOrderBell(true);
+    return;
+  }
+  showSellerOrderRing(order);
+}
+
+async function syncInboxBadgeCount(explicitCount?: number) {
+  try {
+    let count = explicitCount;
+    if (count === undefined) {
+      const res = await sellerApi.notificationUnreadCount();
+      count = Number(res.data?.unread_count ?? 0);
+    }
+    const n = Math.max(0, Number(count) || 0);
+    await Notifications.setBadgeCountAsync(n).catch(() => undefined);
+    return n;
+  } catch {
+    return 0;
+  }
+}
+
+function notificationIsRead(n: SellerNotification) {
+  if (n.read_at) return true;
+  return n.is_read === true || n.is_read === 1 || n.is_read === '1';
+}
+
+/** Mirror seller-panel notificationDecisionStatus — approved vs rejected product alerts. */
+function notificationDecisionStatus(n: SellerNotification): 'approved' | 'rejected' | 'expired' | '' {
+  const action = String(n.action || n.meta?.action || n.meta?.status || n.meta?.approval_status || '').toLowerCase();
+  if (action === 'approved' || action === 'approve') return 'approved';
+  if (action === 'rejected' || action === 'reject') return 'rejected';
+  const blob = `${n.type || ''} ${n.title || ''} ${n.message || ''} ${n.body || ''}`.toLowerCase();
+  if (/\breject(ed|ion)?\b/.test(blob)) return 'rejected';
+  if (/\bapprov(ed|al|e)\b/.test(blob)) return 'approved';
+  if (String(n.type || '').toLowerCase() === 'subscription' || /\bexpir/.test(blob)) return 'expired';
+  return '';
+}
+
+function notificationMatchesFilter(n: SellerNotification, filter: NotifFilter) {
+  if (filter === 'all') return true;
+  return notificationDecisionStatus(n) === filter;
 }
 
 async function syncPendingOrderNotifications(orders: Order[], opts?: { forcePresent?: boolean }) {
@@ -709,24 +1008,31 @@ async function syncPendingOrderNotifications(orders: Order[], opts?: { forcePres
 
   if (!prefs.sound) {
     await stopOrderBell();
+    dismissSellerRing();
+    setSellerRingSound(false);
     await Promise.all(Object.values(next).map((id) => cancelStoredNotificationIds(id)));
     await writeNotificationMap({});
-    await Notifications.setBadgeCountAsync(0).catch(() => undefined);
+    // Do not clear app badge here — badge tracks inbox unread, not orders.
+    await syncInboxBadgeCount().catch(() => undefined);
     return;
   }
 
-  if (alertableOrders.length && appActive) await startOrderBell(true);
+  const ringingOrders = alertableOrders.filter((order) => !isOrderMuted(order.id));
+  setSellerRingSound(true);
+  if (ringingOrders.length && appActive) await startOrderBell(true);
   else await stopOrderBell();
 
   for (const [orderId, notificationId] of Object.entries(current)) {
-    if (!pendingIds.has(orderId)) {
+    if (!pendingIds.has(orderId) || isOrderMuted(Number(orderId))) {
       await cancelStoredNotificationIds(notificationId);
       delete next[orderId];
     }
   }
 
   for (const order of alertableOrders) {
-    next = await schedulePendingOrderNotification(order, next, opts?.forcePresent || !appActive);
+    // Never force-reschedule. forcePresent / background re-present was the
+    // 60s OS remind after the seller muted the popup.
+    next = await schedulePendingOrderNotification(order, next, false);
   }
 
   if (!alertableOrders.length) {
@@ -734,22 +1040,21 @@ async function syncPendingOrderNotifications(orders: Order[], opts?: { forcePres
   }
 
   await writeNotificationMap(next);
-  await Notifications.setBadgeCountAsync(pendingIds.size).catch(() => undefined);
+  // Orders tab keeps pending order count; app/notif badge stays inbox unread only.
+  await syncInboxBadgeCount().catch(() => undefined);
 }
 
 async function cancelOrderNotification(orderId: number) {
   silenceOrderAlert(orderId);
   silenceNativeOrder(orderId);
+  dismissSellerRing();
   await stopOrderBell();
   const map = await readNotificationMap();
-  const ids = orderNotificationIds(orderId);
-  await cancelStoredNotificationIds(map[String(orderId)]);
-  await Notifications.cancelScheduledNotificationAsync(ids.now).catch(() => undefined);
-  await Notifications.cancelScheduledNotificationAsync(ids.remind).catch(() => undefined);
-  await Notifications.dismissNotificationAsync(ids.now).catch(() => undefined);
-  await Notifications.dismissNotificationAsync(ids.remind).catch(() => undefined);
+  await cancelOrderLocalNotifications(orderId, map[String(orderId)]);
   delete map[String(orderId)];
   await writeNotificationMap(map);
+  await Notifications.cancelAllScheduledNotificationsAsync().catch(() => undefined);
+  await cancelLeftoverOrderReminds();
 }
 
 const authApi = {
@@ -800,6 +1105,16 @@ const authApi = {
     await persistAuth(res.data);
   },
   async logout() {
+    setSellerRingSession(false);
+    dismissSellerRing();
+    await stopOrderBell();
+    await Notifications.dismissAllNotificationsAsync().catch(() => undefined);
+    await Notifications.cancelAllScheduledNotificationsAsync().catch(() => undefined);
+    const fcmToken = await readSellerFcmToken().catch(() => '');
+    if (fcmToken) {
+      await request<Record<string, unknown>>('seller/device-token', { body: sellerDeviceTokenBody(fcmToken, true) }).catch(() => undefined);
+      await clearSellerFcmToken().catch(() => undefined);
+    }
     const session = await readSession();
     if (session.refreshToken) {
       await request<Record<string, unknown>>('auth/logout', { auth: true, body: { refresh_token: session.refreshToken } }).catch(() => undefined);
@@ -813,14 +1128,15 @@ const authApi = {
 };
 
 const sellerApi = {
-  dashboard: () => request<DashboardData>('seller/dashboard'),
-  orders: () => request<{ items?: Order[] | null }>('seller/orders'),
-  orderDetail: (orderId: number) => request<OrderDetail>('seller/orders/detail', { query: { order_id: orderId } }),
+  dashboard: () => request<DashboardData>('seller/dashboard', { timeoutMs: 8000 }),
+  livePulse: () => request<{ orders?: string | null; rx?: string | null; notifications?: string | null }>('seller/live-pulse', { timeoutMs: 5000 }),
+  orders: () => request<{ items?: Order[] | null }>('seller/orders', { query: { page: 1, limit: 100 }, timeoutMs: 12000 }),
+  orderDetail: (orderId: number) => request<OrderDetail>('seller/orders/detail', { query: { order_id: orderId }, timeoutMs: 12000 }),
   orderInvoice: (orderId: number) => request<OrderDetail>('seller/orders/invoice', { query: { order_id: orderId } }),
   processOrder: (body: unknown) => request<Record<string, unknown>>('seller/orders/process', { body }),
   prescriptionFill: (body: unknown) => request<OrderDetail>('seller/orders/prescription-fill', { body }),
-  orderAction: (orderId: number, action: string) => request<Record<string, unknown>>('seller/orders/action', { body: { order_id: orderId, action } }),
-  inventory: (search = '') => request<{ items?: InventoryItem[] | null }>('seller/inventory', { query: { search, page: 1, limit: 100, status: 'all' } }),
+  orderAction: (orderId: number, action: string, message?: string) => request<Record<string, unknown>>('seller/orders/action', { body: { order_id: orderId, action, ...(message ? { message } : {}) }, timeoutMs: 25000 }),
+  inventory: (search = '') => request<{ items?: InventoryItem[] | null }>('seller/inventory', { query: { search, page: 1, limit: 100, status: 'all' }, timeoutMs: 8000 }),
   updateStock: (body: unknown) => request<Record<string, unknown>>('seller/inventory/update', { body }),
   catalogSearch: (search: string) => request<{ items?: CatalogSuggestion[] | null }>('seller/catalog/search', { query: { search, limit: 30 } }),
   dailySalesReport: (from: string, to: string) => request<DailySalesReport>('seller/reports/daily-sales', { query: { from, to } }),
@@ -833,10 +1149,10 @@ const sellerApi = {
   savePharmacyInfo: (body: unknown) => request<PharmacyInfoPayload>('seller/pharmacy-info', { body }),
   settings: () => request<SellerSettings>('seller/settings'),
   saveSettings: (body: unknown) => request<SellerSettings>('seller/settings', { body }),
-  notifications: (unread = false) => request<{ items?: SellerNotification[] | null; pagination?: unknown }>('seller/notifications', { query: { page: 1, limit: 50, unread: unread ? 1 : undefined } }),
+  notifications: (unread = false) => request<{ items?: SellerNotification[] | null; unread_count?: number | null; pagination?: unknown }>('seller/notifications', { query: { page: 1, limit: 50, unread: unread ? 1 : undefined } }),
   notificationUnreadCount: () => request<{ unread_count?: number | null }>('seller/notifications/unread-count'),
-  markNotificationRead: (id: number) => request<Record<string, unknown>>(`seller/notifications/${id}/read`, { body: {} }),
-  markAllNotificationsRead: () => request<Record<string, unknown>>('seller/notifications/read-all', { body: {} }),
+  markNotificationRead: (id: number) => request<{ id?: number; unread_count?: number | null }>('seller/notifications/' + id + '/read', { body: {} }),
+  markAllNotificationsRead: () => request<{ updated?: number; unread_count?: number | null }>('seller/notifications/read-all', { body: {} }),
   rxRequests: () => request<{ items?: RxRequest[] | null }>('seller/rx-requests', { query: { status: 'open' } }),
   rxRequestDetail: (requestId: number) => request<RxRequest>('seller/rx-requests/detail', { query: { request_id: requestId } }),
   rxRequestFillToCart: (body: unknown) => request<Record<string, unknown>>('seller/rx-requests/fill-to-cart', { body }),
@@ -876,7 +1192,25 @@ const sellerApi = {
   subscriptionPlans: () => request<{ items?: SellerPlan[] | null }>('seller/subscription/plans'),
   subscriptionPreview: (planId: number) => request<SubscriptionPreview>('seller/subscription/preview', { query: { plan_id: planId, use_wallet: 1 } }),
   subscribePlan: (planId: number) => request<SubscriptionInfo>('seller/subscription/subscribe', { body: { plan_id: planId, payment_method: 'demo', demo_card: '4242 4242 4242 4242', simulate: 'success', use_wallet: 1 } }),
+  deviceToken: (body: { fcm_token: string; token: string; platform: string; device_type: string; device_name: string; unbind?: number }) =>
+    request<{ saved?: number | null; unbound?: number | null; platform?: string | null }>('seller/device-token', { body }),
 };
+
+async function registerSellerFcm() {
+  setSellerRingSession(true);
+  try {
+    await registerSellerPush({
+      ensureReady: ensureNotificationReady,
+      postDeviceToken: (body) => sellerApi.deviceToken(body),
+    });
+  } catch {
+    // Emulators without Play Services cannot mint a native FCM token.
+  }
+}
+
+async function ensureNearbyForward(order: OrderDetail): Promise<OrderDetail> {
+  return order;
+}
 
 TaskManager.defineTask(ORDER_POLL_TASK, async () => {
   try {
@@ -889,6 +1223,7 @@ TaskManager.defineTask(ORDER_POLL_TASK, async () => {
     }
     const response = await sellerApi.orders();
     const orders = response.data?.items ?? [];
+    await hydrateMutedOrderIds();
     await syncPendingOrderNotifications(orders);
     return orders.some((order) => pendingStatus(order.status))
       ? BackgroundFetch.BackgroundFetchResult.NewData
@@ -939,9 +1274,12 @@ function SellerRoot() {
   useEffect(() => {
     readSession().then(async (s) => {
       if (s.accessToken) {
+        setSellerRingSession(true);
         try { await authApi.me(); setLoggedIn(true); }
         catch { setLoggedIn(Boolean(s.accessToken)); }
       } else {
+        setSellerRingSession(false);
+        dismissSellerRing();
         setLoggedIn(false);
       }
       setBooting(false);
@@ -951,7 +1289,7 @@ function SellerRoot() {
   if (!splashDone) return <Splash />;
   if (booting) return <CenteredLoader />;
   if (!loggedIn) return <AuthScreen onDone={() => setLoggedIn(true)} />;
-  return <SellerShell onLogout={async () => { await stopOrderBell(); await stopOrderWatch(); await authApi.logout(); setLoggedIn(false); }} />;
+  return <SellerShell onLogout={async () => { await authApi.logout(); setLoggedIn(false); }} />;
 }
 
 function Splash() {
@@ -1007,12 +1345,13 @@ function AuthScreen({ onDone }: { onDone: () => void }) {
   }
 
   return (
-    <ScrollView style={s.authScreen} contentContainerStyle={s.authWrap} keyboardShouldPersistTaps="handled">
+    <KeyboardAvoidingView style={s.authScreen} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+    <ScrollView style={{ flex: 1 }} contentContainerStyle={s.authWrap} keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag">
       <View style={s.loginBrand}>
         <Image source={LOGO} style={s.authLogo} resizeMode="contain" />
       </View>
       <Text style={s.loginTitle}>Welcome to ZepMed</Text>
-      <Text style={s.loginSub}>Your premium healthcare & medicine companion</Text>
+      <Text style={s.loginSub}>Seller partner app for pharmacy orders</Text>
 
       {tab === 'otp' ? (
         <>
@@ -1069,6 +1408,7 @@ function AuthScreen({ onDone }: { onDone: () => void }) {
       {error ? <Notice tone="error" title={error} /> : notice.includes('OTP sent') ? <Notice tone="success" title={notice} /> : null}
       <Text style={s.termsText}>By continuing, you agree to our <Text style={s.termsLink} onPress={() => Linking.openURL('https://zepmed.org/terms')}>Terms of Service</Text> and <Text style={s.termsLink} onPress={() => Linking.openURL('https://zepmed.org/privacy')}>Privacy Policy</Text></Text>
     </ScrollView>
+    </KeyboardAvoidingView>
   );
 }
 
@@ -1086,10 +1426,52 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
   const [showReport, setShowReport] = useState(false);
   const [moreModule, setMoreModule] = useState<MoreModule>(null);
   const [fresh, setFresh] = useState<Order | null>(null);
+  const [popupOutcome, setPopupOutcome] = useState<'accepted' | 'rejected' | null>(null);
+  const [notifUnread, setNotifUnread] = useState(0);
   const knownOrders = useRef<Set<number>>(new Set());
+  const localOrderStubs = useRef<Map<number, Order>>(new Map());
+  const ordersRef = useRef<Order[]>([]);
+  const dashRef = useRef<DashboardData | null>(null);
+  const freshRef = useRef<Order | null>(null);
   const refreshInFlight = useRef(false);
-  const refreshQueued = useRef(false);
+  const refreshQueued = useRef<'orders' | 'full' | false>(false);
+  const lastOrdersPulse = useRef('');
   const tabHistory = useRef<TabKey[]>([]);
+  ordersRef.current = orders;
+  dashRef.current = dash;
+  freshRef.current = fresh;
+
+  function rememberIncomingOrder(order: Order) {
+    const prev = localOrderStubs.current.get(order.id) || ordersRef.current.find((item) => item.id === order.id);
+    const merged = applyRejectedStatus(mergeIncomingOrder(prev, order));
+    if (isOrderRejected(merged.id)) {
+      localOrderStubs.current.delete(merged.id);
+      knownOrders.current.add(merged.id);
+      setOrders((list) => mergeRejectedIntoOrders(
+        list.some((item) => item.id === merged.id)
+          ? list.map((item) => item.id === merged.id ? merged : item)
+          : [merged, ...list],
+      ).map(applyRejectedStatus));
+      return merged;
+    }
+    localOrderStubs.current.set(merged.id, merged);
+    knownOrders.current.add(merged.id);
+    setOrders((list) => (
+      list.some((item) => item.id === merged.id)
+        ? list.map((item) => item.id === merged.id ? mergeIncomingOrder(item, merged) : item)
+        : [merged, ...list]
+    ));
+    return merged;
+  }
+
+  const refreshNotifUnread = useCallback(async () => {
+    try {
+      const n = await syncInboxBadgeCount();
+      setNotifUnread(n);
+    } catch {
+      setNotifUnread(0);
+    }
+  }, []);
 
   const goTab = useCallback((next: TabKey, filter?: OrderFilter) => {
     if (filter) setOrderFilter(filter);
@@ -1101,7 +1483,7 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
 
   const refresh = useCallback(async (silent = false, force = false) => {
     if (refreshInFlight.current) {
-      if (force) refreshQueued.current = true;
+      if (force) refreshQueued.current = silent ? 'orders' : 'full';
       return;
     }
     refreshInFlight.current = true;
@@ -1109,36 +1491,73 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
     setError('');
     let nextError = '';
     try {
-      try {
-        const d = await sellerApi.dashboard();
-        setDash(d.data ?? null);
-      } catch (err) {
-        if (!silent || !isAbortError(err)) nextError = errorMessage(err);
-      }
-
-      let next: Order[] = [];
-      try {
+      const loadOrders = async () => {
+        await hydrateRejectedOrders();
         const o = await sellerApi.orders();
-        next = (o.data?.items ?? []).sort((a, b) => (b.created_at ?? '').localeCompare(a.created_at ?? '') || b.id - a.id);
-      } catch (err) {
-        if (!silent || !isAbortError(err)) nextError = nextError || errorMessage(err);
-      }
+        let next = (o.data?.items ?? []).sort((a, b) => (b.created_at ?? '').localeCompare(a.created_at ?? '') || b.id - a.id);
+        next = next.map((order) => keepSellerAck(ordersRef.current.find((item) => item.id === order.id), order));
+        for (const [id, stub] of localOrderStubs.current) {
+          if (isOrderRejected(id) || next.some((order) => order.id === id)) localOrderStubs.current.delete(id);
+          else next = [stub, ...next];
+        }
+        next = mergeRejectedIntoOrders(next).map(applyRejectedStatus);
+        const firstFresh = next.find((order) => !knownOrders.current.has(order.id) && orderCanShowNewPopup(order));
+        const sessionAlreadyHydrated = knownOrders.current.size > 0;
+        if (firstFresh && (sessionAlreadyHydrated || orderIsRecent(firstFresh))) {
+          if (!knownOrders.current.has(firstFresh.id)) setPopupOutcome(null);
+          if (!isOrderMuted(firstFresh.id)) ringIncomingOrder(firstFresh);
+          else void stopOrderBell();
+        }
+        setFresh((current) => {
+          let nextFresh = current;
+          if (firstFresh && (sessionAlreadyHydrated || orderIsRecent(firstFresh))) {
+            if (!current) nextFresh = firstFresh;
+            else if (current.id === firstFresh.id) nextFresh = mergeIncomingOrder(current, firstFresh);
+          }
+          if (!nextFresh) return nextFresh;
+          const openFresh = applyRejectedStatus(nextFresh);
+          if (isOrderRejected(openFresh.id) || ['rejected', 'cancelled'].includes(orderStatusKey(openFresh.status))) return null;
+          const full = next.find((order) => order.id === openFresh.id);
+          return full ? applyRejectedStatus(mergeIncomingOrder(openFresh, full)) : openFresh;
+        });
+        knownOrders.current = new Set(next.map((order) => order.id));
+        setOrders(next);
+        await syncPendingOrderNotifications(next);
+        return next;
+      };
 
-      const firstFresh = next.find((order) => !knownOrders.current.has(order.id) && orderCanShowNewPopup(order));
-      if (knownOrders.current.size && firstFresh) {
-        setFresh(firstFresh);
-        Vibration.vibrate([0, 300, 120, 300]);
-        goTab('orders', 'pending');
-      }
-      knownOrders.current = new Set(next.map((order) => order.id));
-      setOrders(next);
-      await syncPendingOrderNotifications(next);
-
-      try {
-        const inv = await sellerApi.inventory();
-        setInventory(inv.data?.items ?? []);
-      } catch (err) {
-        if (!isAbortError(err) && !inventory.length) nextError = nextError || errorMessage(err);
+      if (silent) {
+        try {
+          if (!force) {
+            try {
+              const pulse = await sellerApi.livePulse();
+              const stamp = String(pulse.data?.orders || '');
+              const haveData = !!dashRef.current && ordersRef.current.length > 0;
+              if (haveData && stamp && stamp === lastOrdersPulse.current) return;
+              if (stamp) lastOrdersPulse.current = stamp;
+            } catch {
+              // live-pulse may 404 on older PHP — fall through to full list.
+            }
+          }
+          const jobs: Promise<unknown>[] = [loadOrders()];
+          if (!dashRef.current) {
+            jobs.push(
+              sellerApi.dashboard().then((d) => setDash(d.data ?? null)).catch((err) => {
+                if (!isAbortError(err)) nextError = nextError || errorMessage(err);
+              }),
+            );
+          }
+          await Promise.all(jobs);
+        } catch (err) {
+          if (!isAbortError(err)) nextError = errorMessage(err);
+        }
+      } else {
+        await Promise.all([
+          loadOrders().catch((err) => { if (!isAbortError(err)) nextError = nextError || errorMessage(err); }),
+          sellerApi.dashboard().then((d) => setDash(d.data ?? null)).catch((err) => { if (!isAbortError(err)) nextError = nextError || errorMessage(err); }),
+          sellerApi.inventory().then((inv) => setInventory(inv.data?.items ?? [])).catch((err) => { if (!isAbortError(err)) nextError = nextError || errorMessage(err); }),
+          refreshNotifUnread().catch(() => undefined),
+        ]);
       }
       if (nextError) setError(nextError);
     } catch (err) {
@@ -1147,16 +1566,32 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
       setRefreshing(false);
       refreshInFlight.current = false;
       if (refreshQueued.current) {
+        const queued = refreshQueued.current;
         refreshQueued.current = false;
-        refresh(true, true);
+        refresh(queued !== 'full', true);
       }
     }
-  }, [goTab, inventory.length, tab]);
+  }, [refreshNotifUnread]);
 
   useEffect(() => {
-    refresh(true);
-    const timer = setInterval(() => refresh(true), 15000);
-    return () => clearInterval(timer);
+    prepareOrderBell().catch(() => undefined);
+    setSellerRingAppActive(AppState.currentState === 'active');
+    readPrefs().then((prefs) => setSellerRingSound(prefs.sound)).catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    let timer: ReturnType<typeof setInterval> | undefined;
+    let cancelled = false;
+    void hydrateMutedOrderIds();
+    void hydrateRejectedOrders().finally(() => {
+      if (cancelled) return;
+      refresh(false, true);
+    });
+    timer = setInterval(() => refresh(true), 15000);
+    return () => {
+      cancelled = true;
+      if (timer) clearInterval(timer);
+    };
   }, [refresh]);
 
   useEffect(() => {
@@ -1165,30 +1600,114 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
       startOrderWatch(session.accessToken, session.refreshToken, prefs.sound);
     }).catch(() => undefined);
     registerOrderBackgroundTask().catch(() => undefined);
-    const sub = Notifications.addNotificationResponseReceivedListener((response) => {
-      const orderId = Number(response.notification.request.content.data?.orderId || 0);
-      const actionId = response.actionIdentifier;
-      if (orderId && actionId === 'accept') {
-        const order = orders.find((item) => item.id === orderId);
-        const code = order && isPrescription(order) ? 'rx_accept' : 'confirmed';
-        action(orderId, code).catch(() => openOrder(orderId));
-      } else if (orderId) {
-        openOrder(orderId);
+    void registerSellerFcm();
+    const openFromLink = (url?: string | null) => {
+      const orderId = orderIdFromSellerLink(url);
+      if (!orderId) return;
+      dismissSellerRing();
+      openOrder(orderId);
+      void refresh(true, true);
+    };
+    Linking.getInitialURL().then(openFromLink).catch(() => undefined);
+    const linkSub = Linking.addEventListener('url', (event) => openFromLink(event.url));
+    const ringSub = subscribeSellerOrderRing((event) => {
+      const existing = ordersRef.current.find((item) => item.id === event.orderId);
+      const stub = orderStubFromNotificationData({
+        order_id: event.orderId,
+        title: event.title,
+        message: event.body,
+        customer_name: event.body.split('·')[0]?.trim(),
+      });
+      const incoming = stub ? mergeIncomingOrder(existing, stub as Order) : existing;
+      if (incoming && !isOrderRejected(incoming.id)) {
+        const remembered = rememberIncomingOrder(incoming);
+        if (orderCanShowNewPopup(remembered)) setFresh(remembered);
+        ringIncomingOrder(remembered);
       }
+      void refresh(true, true);
     });
-    const appSub = AppState.addEventListener('change', (state) => {
-      if (state === 'active') {
-        refresh(true);
+    const sub = Notifications.addNotificationResponseReceivedListener((response) => {
+      void hydrateRejectedOrders().then(() => {
+      const data = (response.notification.request.content.data || {}) as Record<string, unknown>;
+      const orderId = orderIdFromNotificationData(data) || Number(data.orderId || 0);
+      const actionId = response.actionIdentifier;
+      const stub = orderStubFromNotificationData(data);
+      const existing = ordersRef.current.find((item) => item.id === orderId);
+      const incoming = stub ? mergeIncomingOrder(existing, stub as Order) : existing;
+      const remembered = incoming ? rememberIncomingOrder(incoming) : incoming;
+      if (orderId && isOrderRejected(orderId)) {
+        openOrder(orderId, remembered);
+        void refresh(true, true);
         return;
       }
+      if (orderId && actionId === 'accept') {
+        const code = incoming && isPrescription(incoming) ? 'rx_accept' : 'confirmed';
+        action(orderId, code).catch(() => openOrder(orderId, remembered));
+      } else if (orderId) {
+        if (remembered && orderCanShowNewPopup(remembered)) {
+          setFresh((current) => current?.id === remembered.id ? mergeIncomingOrder(current, remembered) : remembered);
+        }
+        openOrder(orderId, remembered);
+      }
+      void refresh(true, true);
+      });
+    });
+    const received = Notifications.addNotificationReceivedListener((notification) => {
+      void hydrateRejectedOrders().then(() => {
+      const data = (notification.request.content.data || {}) as Record<string, unknown>;
+      const stub = orderStubFromNotificationData(data);
+      const existing = stub ? ordersRef.current.find((item) => item.id === stub.id) : undefined;
+      const incoming = stub ? mergeIncomingOrder(existing, stub as Order) : existing;
+      if (incoming) {
+        const remembered = rememberIncomingOrder(incoming);
+        if (orderCanShowNewPopup(remembered)) {
+          setFresh((current) => current?.id === remembered.id ? mergeIncomingOrder(current, remembered) : remembered);
+        }
+      }
+      if (incoming && !isOrderRejected(incoming.id) && !isOrderMuted(incoming.id)) ringIncomingOrder(incoming);
+      else if (stub && !isOrderRejected(stub.id) && !isOrderMuted(stub.id)) ringIncomingOrder(stub as Order);
+      void refresh(true, true);
+      });
+    });
+    const appSub = AppState.addEventListener('change', (state) => {
+      const active = state === 'active';
+      setSellerRingAppActive(active);
+      if (active) {
+        dismissSellerRing();
+        readPrefs().then((prefs) => setOrderWatchSound(prefs.sound)).catch(() => undefined);
+        const empty = !dashRef.current || !ordersRef.current.length;
+        refresh(empty ? false : true, true);
+        return;
+      }
+      setOrderWatchSound(false);
+      const current = freshRef.current;
+      if (current && orderCanShowNewPopup(current) && !isOrderMuted(current.id)) showSellerOrderRing(current);
       stopOrderBell();
-      syncPendingOrderNotifications(orders, { forcePresent: true }).catch(() => undefined);
+      syncPendingOrderNotifications(ordersRef.current).catch(() => undefined);
+    });
+    const muteSub = subscribeMutedOrders(() => {
+      syncPendingOrderNotifications(ordersRef.current).catch(() => undefined);
     });
     return () => {
       sub.remove();
+      received.remove();
       appSub.remove();
+      linkSub.remove();
+      ringSub();
+      muteSub();
     };
-  }, [orders, refresh]);
+  }, [refresh]);
+
+  useEffect(() => {
+    if (!fresh) return;
+    if (orderBillAmount(fresh) > 0 && orderCustomerName(fresh.customer_name)) return;
+    let cancelled = false;
+    sellerApi.orderDetail(fresh.id).then((res) => {
+      if (cancelled || !res.data) return;
+      setFresh((current) => current?.id === res.data!.id ? mergeIncomingOrder(current, res.data as Order) : current);
+    }).catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [fresh?.id]);
 
   useEffect(() => {
     const sub = BackHandler.addEventListener('hardwareBackPress', () => {
@@ -1219,28 +1738,106 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
     return () => sub.remove();
   }, [moreModule, refresh, selectedOrder, showReport, tab]);
 
-  async function openOrder(id: number) {
-    const seed = orders.find((order) => order.id === id);
-    if (seed) setSelectedOrder(seed as OrderDetail);
+  async function openOrder(id: number, seed?: Order | null) {
+    const local = applyRejectedStatus((seed || ordersRef.current.find((order) => order.id === id) || { id, order_number: `Order #${id}`, status: 'placed', total_amount: 0 }) as Order);
+    setSelectedOrder(withNearbyForward({
+      ...local,
+      id,
+      order_number: local.order_number || `Order #${id}`,
+      status: isOrderRejected(id) ? 'rejected' : (local.status || 'placed'),
+      total_amount: local.total_amount || 0,
+    } as OrderDetail));
     try {
       const detail = await sellerApi.orderDetail(id);
-      setSelectedOrder(detail.data ?? null);
+      if (detail.data) {
+        localOrderStubs.current.delete(id);
+        const next = applyRejectedStatus(detail.data);
+        setSelectedOrder(await ensureNearbyForward(next));
+        rememberIncomingOrder(next);
+      }
     } catch (err) {
       Alert.alert('Order', errorMessage(err));
     }
   }
 
   async function action(orderId: number, code: string) {
+    if (code === 'confirmed' || code === 'rx_accept') stopSellerAlertNow(orderId);
     try {
-      await sellerApi.orderAction(orderId, code);
+      const current = ordersRef.current.find((o) => o.id === orderId);
+      if (code === 'ready_for_pickup') {
+        if (orderAlreadyReadyOrPast(current?.status)) {
+          Alert.alert('Ready', 'Order is already ready for pickup');
+          return;
+        }
+        if (!orderCanMarkReady(current?.status)) {
+          Alert.alert('Ready', 'Accept the order first, then mark Ready');
+          return;
+        }
+        const res = await markOrderReadyOnce(orderId, current?.status);
+        await cancelOrderNotification(orderId);
+        setFresh((f) => f?.id === orderId ? null : f);
+        const nextStatus = typeof res.data?.status === 'string' ? String(res.data.status) : 'ready_for_pickup';
+        setOrders((list) => list.map((order) => (
+          order.id === orderId ? { ...order, status: nextStatus } : order
+        )));
+        if (!res.skipped && res.auto_assigned) Alert.alert('Ready', 'Delivery partner auto-assigned');
+        else if (!res.skipped) Alert.alert('Ready', 'Marked ready — delivery partners notified');
+        await refresh(true, true);
+        return;
+      }
+      const message = decisionActionMessage(code) || (code === 'rejected' ? 'Rejected by pharmacy' : code === 'wrong_prescription' ? 'Wrong prescription' : undefined);
+      let res: ApiWrap<Record<string, unknown>>;
+      try {
+        res = await sellerApi.orderAction(orderId, code, message);
+      } catch (err) {
+        const msg = errorMessage(err);
+        if (/already accepted/i.test(msg)) {
+          res = { success: true, data: { order_id: orderId, already: true, status: current?.status || 'prescription_review' } };
+        } else if (code === 'rx_accept' && /only prescription review/i.test(msg)) {
+          res = await sellerApi.orderAction(orderId, 'confirmed', readyActionMessage('confirmed'));
+        } else {
+          throw err;
+        }
+      }
       await cancelOrderNotification(orderId);
-      setFresh((current) => current?.id === orderId ? null : current);
-      setOrders((current) => current.map((order) => (
-        order.id === orderId
-          ? { ...order, status: code === 'rx_accept' ? 'confirmed' : code, seller_confirmed_at: new Date().toISOString() }
-          : order
-      )));
-      await refresh(true, true);
+      const outcome = code === 'rx_accept' || code === 'confirmed'
+        ? 'accepted' as const
+        : code === 'rejected' || code === 'wrong_prescription'
+          ? 'rejected' as const
+          : null;
+      const showingPopup = fresh?.id === orderId;
+      if (showingPopup && outcome) setPopupOutcome(outcome);
+      else setFresh((currentFresh) => currentFresh?.id === orderId ? null : currentFresh);
+      const confirmedAt = typeof res.data?.seller_confirmed_at === 'string' && res.data.seller_confirmed_at
+        ? String(res.data.seller_confirmed_at)
+        : new Date().toISOString();
+      const nextStatus = outcome === 'rejected'
+        ? 'rejected'
+        : code === 'rx_accept'
+          ? (typeof res.data?.status === 'string' ? String(res.data.status) : 'prescription_review')
+          : (typeof res.data?.status === 'string' ? String(res.data.status) : code);
+      if (outcome === 'rejected') {
+        const snap = rejectedLocalOrder(current, orderId);
+        await rememberRejectedOrder(snap);
+        setOrders((list) => {
+          const next = list.some((order) => order.id === orderId)
+            ? list.map((order) => (order.id === orderId ? { ...order, status: 'rejected' } : order))
+            : [snap, ...list];
+          return mergeRejectedIntoOrders(next);
+        });
+      } else {
+        setOrders((list) => list.map((order) => (
+          order.id === orderId
+            ? { ...order, status: nextStatus, seller_confirmed_at: code === 'rx_accept' || code === 'confirmed' ? (order.seller_confirmed_at || confirmedAt) : order.seller_confirmed_at }
+            : order
+        )));
+      }
+      if (!showingPopup) {
+        if (outcome === 'accepted') Alert.alert('Order accepted');
+        else if (outcome === 'rejected') Alert.alert('Order rejected');
+      }
+      void refresh(true, true);
+      return outcome ?? undefined;
     } catch (err) {
       Alert.alert('Action failed', errorMessage(err));
     }
@@ -1267,9 +1864,49 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
     goTab('orders', nextFilter);
   }
 
-  if (selectedOrder) return <OrderDetailScreen order={selectedOrder} dash={dash} onBack={() => { setSelectedOrder(null); refresh(true); }} />;
-  if (showReport) return <ReportsScreen onBack={() => setShowReport(false)} />;
-  if (moreModule) return <MoreModuleScreen module={moreModule} dash={dash} onBack={() => { setMoreModule(null); refresh(true); }} onRefresh={() => refresh(true)} />;
+  const popup = (
+    <NewOrderPopup
+      order={fresh}
+      outcome={popupOutcome}
+      onClose={() => { setFresh(null); setPopupOutcome(null); }}
+      onOpen={() => {
+        const order = fresh;
+        setFresh(null);
+        setPopupOutcome(null);
+        if (order) openOrder(order.id);
+      }}
+      onAction={(code) => {
+        const order = fresh;
+        if (!order) return;
+        void action(order.id, code);
+      }}
+    />
+  );
+
+  if (selectedOrder) {
+    return (
+      <View style={{ flex: 1 }}>
+        <OrderDetailScreen order={selectedOrder} dash={dash} onBack={() => { setSelectedOrder(null); refresh(true, true); }} />
+        {popup}
+      </View>
+    );
+  }
+  if (showReport) {
+    return (
+      <View style={{ flex: 1 }}>
+        <ReportsScreen onBack={() => setShowReport(false)} />
+        {popup}
+      </View>
+    );
+  }
+  if (moreModule) {
+    return (
+      <View style={{ flex: 1 }}>
+        <MoreModuleScreen module={moreModule} dash={dash} onBack={() => { setMoreModule(null); refresh(true); }} onRefresh={() => refresh(true)} onUnreadChange={(n) => { setNotifUnread(n); syncInboxBadgeCount(n).catch(() => undefined); }} />
+        {popup}
+      </View>
+    );
+  }
 
   return (
     <View style={s.screen}>
@@ -1278,25 +1915,31 @@ function SellerShell({ onLogout }: { onLogout: () => Promise<void> }) {
           title={tab === 'home' ? 'ZepMed Seller' : tab === 'stock' ? 'Stock Management' : tab[0].toUpperCase() + tab.slice(1)}
           subtitle={[dash?.pharmacy?.name, dash?.pharmacy?.city].filter(Boolean).join(' • ') || 'Pharmacy'}
           onRefresh={() => refresh()}
+          notifUnread={notifUnread}
+          onOpenNotifications={() => setMoreModule('notifications')}
         />
       </View>
-      <ScrollView refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => refresh()} tintColor={C.teal} />} contentContainerStyle={s.body}>
-        {fresh && tab === 'orders' ? <FreshBanner order={fresh} onClose={() => setFresh(null)} onOpen={() => openOrder(fresh.id)} /> : null}
+      <ScrollView
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => refresh()} tintColor={C.teal} />}
+        contentContainerStyle={[s.body, { paddingBottom: 110 + Math.max(insets.bottom, 10) }]}
+        keyboardShouldPersistTaps="handled"
+        keyboardDismissMode="on-drag"
+      >
         {error ? <Notice tone="error" title={error} /> : null}
         {tab === 'home' ? <HomeScreen dash={dash} orders={orders} onOpenOrder={openOrder} onAction={action} onDashboardTarget={openDashboardTarget} onStoreToggle={toggleStoreOpen} /> : null}
         {tab === 'orders' ? <OrdersScreen orders={orders} filter={orderFilter} onFilter={setOrderFilter} onOpenOrder={openOrder} onAction={action} /> : null}
         {tab === 'catalog' ? <CatalogScreen items={inventory} onEdit={setEditItem} onStock={() => goTab('stock')} onAddProducts={() => setMoreModule('products')} /> : null}
         {tab === 'stock' ? <StockManagementScreen /> : null}
-        {tab === 'more' ? <MoreScreen dash={dash} onReport={() => setShowReport(true)} onOpenModule={setMoreModule} onRefresh={() => refresh()} onLogout={onLogout} /> : null}
+        {tab === 'more' ? <MoreScreen dash={dash} notifUnread={notifUnread} onReport={() => setShowReport(true)} onOpenModule={setMoreModule} onRefresh={() => refresh()} onLogout={onLogout} /> : null}
       </ScrollView>
       <BottomTabs current={tab} setTab={goTab} pending={orders.filter((o) => pendingStatus(o.status)).length} />
       <StockEditModal item={editItem} onClose={() => setEditItem(null)} onSaved={() => { setEditItem(null); refresh(true); }} />
-      <NewOrderPopup order={fresh} onClose={() => setFresh(null)} onOpen={() => { const order = fresh; setFresh(null); if (order) openOrder(order.id); }} />
+      {popup}
     </View>
   );
 }
 
-function Header({ title, subtitle, onRefresh, onLogout }: { title: string; subtitle: string; onRefresh: () => void; onLogout?: () => void }) {
+function Header({ title, subtitle, onRefresh, onLogout, notifUnread = 0, onOpenNotifications }: { title: string; subtitle: string; onRefresh: () => void; onLogout?: () => void; notifUnread?: number; onOpenNotifications?: () => void }) {
   return (
     <View style={s.header}>
       <Image source={APP_ICON} style={s.headerLogo} resizeMode="cover" />
@@ -1304,6 +1947,12 @@ function Header({ title, subtitle, onRefresh, onLogout }: { title: string; subti
         <Text style={s.headerTitle} numberOfLines={1}>{title}</Text>
         <Text style={s.headerSub} numberOfLines={1}>{subtitle}</Text>
       </View>
+      {onOpenNotifications ? (
+        <TouchableOpacity style={s.iconButton} onPress={onOpenNotifications} accessibilityLabel="Notifications">
+          <Text style={s.iconText}>🔔</Text>
+          {notifUnread > 0 ? <Text style={s.headerNotifBadge}>{notifUnread > 99 ? '99+' : String(notifUnread)}</Text> : null}
+        </TouchableOpacity>
+      ) : null}
       <IconButton label="↻" onPress={onRefresh} />
       {onLogout ? <IconButton label="‹" onPress={onLogout} /> : null}
     </View>
@@ -1325,55 +1974,84 @@ function HomeScreen({
   onDashboardTarget: (target: DashboardTarget) => void;
   onStoreToggle: (nextOpen: boolean) => void;
 }) {
-  if (!dash) return <CenteredLoader />;
-  const open = dash.is_open !== false && dash.is_open !== 0;
+  const { narrow } = useLayoutScale();
+  const open = !dash || (dash.is_open !== false && dash.is_open !== 0);
+  // Pending = not yet accepted only (placed/new/prescription_review). Do NOT use pending_dispatch.
+  const pendingCount = orders.filter((o) => pendingStatus(o.status)).length;
+  const preparingCount = orders.filter((o) => ['confirmed', 'preparing', 'partial_forward'].includes(orderStatusKey(o.status))).length;
+  const readyCount = orders.filter((o) => orderStatusKey(o.status) === 'ready_for_pickup').length;
+  const recent = orders.slice(0, narrow ? 4 : 6);
   return (
     <>
       <View style={s.dashboardCard}>
         <View style={s.rowBetween}>
-          <View>
-            <Text style={s.bigTitle}>{dash.pharmacy?.name || 'Your pharmacy'}</Text>
-            <Text style={s.muted}>{dash.pharmacy?.city || 'Open for orders'} • Open for orders</Text>
+          <View style={{ flex: 1, minWidth: 0 }}>
+            <Text style={s.bigTitle} numberOfLines={2}>{dash?.pharmacy?.name || 'Your pharmacy'}</Text>
+            <Text style={s.muted} numberOfLines={1}>{dash?.pharmacy?.city || 'Seller dashboard'}</Text>
           </View>
           <Pill text={open ? 'Open' : 'Closed'} tone={open ? 'green' : 'red'} />
         </View>
         <TouchableOpacity style={[s.storeToggle, open ? s.storeToggleOpen : s.storeToggleClosed]} onPress={() => onStoreToggle(!open)}>
-          <View>
+          <View style={{ flex: 1, minWidth: 0 }}>
             <Text style={[s.storeToggleTitle, { color: open ? C.green : C.red }]}>{open ? 'Store is open' : 'Store is closed'}</Text>
-            <Text style={[s.storeToggleBody, { color: open ? C.green : C.red }]}>{open ? 'Tap to stop receiving new customer orders' : 'Tap to start receiving new customer orders'}</Text>
+            <Text style={[s.storeToggleBody, { color: open ? C.green : C.red }]} numberOfLines={2}>
+              {open ? 'Tap to pause new customer orders' : 'Tap to receive new customer orders'}
+            </Text>
           </View>
           <Text style={[s.storeToggleAction, { color: open ? C.green : C.red }]}>{open ? 'Close' : 'Open'}</Text>
         </TouchableOpacity>
+
+        <Text style={s.dashSectionLabel}>Order status</Text>
+        <View style={s.statusStrip}>
+          <StatusHero
+            label="Pending accept"
+            hint="Not accepted yet"
+            value={String(pendingCount)}
+            tone="warm"
+            onPress={() => onDashboardTarget('pending')}
+          />
+          <StatusHero
+            label="Preparing"
+            hint="Confirmed / prepping"
+            value={String(preparingCount)}
+            tone="blue"
+            onPress={() => onDashboardTarget('orders')}
+          />
+          <StatusHero
+            label="Ready"
+            hint="Awaiting delivery"
+            value={String(readyCount)}
+            tone="green"
+            onPress={() => onDashboardTarget('orders')}
+          />
+        </View>
+
+        <Text style={s.dashSectionLabel}>Today overview</Text>
         <View style={s.summaryGrid}>
-          <SummaryTile label="Total Orders" value={String(dash.orders_total ?? 0)} onPress={() => onDashboardTarget('orders')} />
-          <SummaryTile label="Revenue" value={shortMoney(dash.revenue_total)} onPress={() => onDashboardTarget('revenue')} />
-          <SummaryTile label="Pending" value={String(dash.pending_dispatch ?? 0)} onPress={() => onDashboardTarget('pending')} />
-          <SummaryTile label="Delivered" value={String(dash.delivered_count ?? 0)} onPress={() => onDashboardTarget('delivered')} />
+          <SummaryTile label="Total orders" value={dash ? String(dash.orders_total ?? 0) : '—'} onPress={() => onDashboardTarget('orders')} />
+          <SummaryTile label="Revenue" value={dash ? shortMoney(dash.revenue_total) : '—'} onPress={() => onDashboardTarget('revenue')} />
+          <SummaryTile label="Delivered" value={dash ? String(dash.delivered_count ?? 0) : '—'} onPress={() => onDashboardTarget('delivered')} />
+          <SummaryTile label="Wallet" value={dash ? shortMoney(dash.pharmacy_wallet_balance) : '—'} onPress={() => onDashboardTarget('orders')} />
         </View>
       </View>
-      <View style={[s.infoCard, { backgroundColor: C.blueSoft }]}>
-        <Text style={[s.infoTitle, { color: C.blue }]}>Global catalog synced</Text>
-        <Text style={[s.infoText, { color: C.blue }]}>Products update when orders are confirmed</Text>
-      </View>
-      {(dash.inventory_low_stock ?? 0) > 0 ? (
+
+      {(dash?.inventory_low_stock ?? 0) > 0 ? (
         <View style={[s.infoCard, { backgroundColor: C.yellowSoft }]}>
-          <Text style={[s.infoTitle, { color: C.yellow }]}>{dash.inventory_low_stock} products are low in stock</Text>
-          <Text style={[s.infoText, { color: C.yellow }]}>Review stock or purchase from a wholeseller.</Text>
+          <Text style={[s.infoTitle, { color: C.yellow }]}>{dash?.inventory_low_stock} products low in stock</Text>
+          <Text style={[s.infoText, { color: C.yellow }]}>Review stock or buy from a wholesaler.</Text>
         </View>
       ) : null}
-      {dash.drug_license?.message ? (
+      {dash?.drug_license?.message ? (
         <View style={[s.infoCard, { backgroundColor: dash.drug_license.restricted ? C.redSoft : C.yellowSoft }]}>
           <Text style={[s.infoTitle, { color: dash.drug_license.restricted ? C.red : C.yellow }]}>Drug license {dash.drug_license.status || ''}</Text>
-          <Text style={[s.infoText, { color: dash.drug_license.restricted ? C.red : C.yellow }]}>{dash.drug_license.message}{dash.drug_license.expiry_date ? ` • Expires ${dash.drug_license.expiry_date}` : ''}</Text>
+          <Text style={[s.infoText, { color: dash.drug_license.restricted ? C.red : C.yellow }]}>
+            {dash.drug_license.message}{dash.drug_license.expiry_date ? ` • Expires ${dash.drug_license.expiry_date}` : ''}
+          </Text>
         </View>
       ) : null}
-      <View style={s.statRow}>
-        <StatCard label="Wallet" value={shortMoney(dash.pharmacy_wallet_balance)} warm />
-        <StatCard label="Owner" value={dash.owner_name || dash.pharmacy?.name || '-'} />
-      </View>
-      <HomeReferralCard />
+
       <SectionTitle title="Recent orders" right={`${orders.length} total`} />
-      {orders.slice(0, 6).map((o) => <OrderCard key={o.id} order={o} onOpen={() => onOpenOrder(o.id)} onAction={(code) => onAction(o.id, code)} />)}
+      {recent.map((o) => <OrderCard key={o.id} order={o} onOpen={() => onOpenOrder(o.id)} onAction={(code) => onAction(o.id, code)} />)}
       {!orders.length ? <Empty title="No orders yet" body="New customer orders will appear here." /> : null}
     </>
   );
@@ -1401,6 +2079,7 @@ function OrdersScreen({
       preparing: ['confirmed', 'preparing'],
       ready: ['ready_for_pickup'],
       delivered: ['delivered', 'completed'],
+      rejected: ['rejected', 'cancelled'],
     };
     const q = query.trim().toLowerCase();
     return orders.filter((o) => {
@@ -1414,7 +2093,7 @@ function OrdersScreen({
       <SearchBox placeholder="Search order #, customer, address..." value={query} onChangeText={setQuery} />
       <Segment<OrderFilter>
         value={filter}
-        options={[['all', 'All'], ['pending', 'Pending'], ['rx', 'Prescription'], ['preparing', 'Preparing'], ['ready', 'Ready'], ['delivered', 'Delivered']]}
+        options={[['all', 'All'], ['pending', 'Pending'], ['rx', 'Prescription'], ['preparing', 'Preparing'], ['ready', 'Ready'], ['delivered', 'Delivered'], ['rejected', 'Rejected']]}
         onChange={onFilter}
         dark
       />
@@ -1455,11 +2134,7 @@ function CatalogScreen({ items, onEdit, onStock, onAddProducts }: { items: Inven
   );
 }
 
-function MoreScreen({ dash, onReport, onOpenModule, onRefresh, onLogout }: { dash: DashboardData | null; onReport: () => void; onOpenModule: (module: MoreModule) => void; onRefresh: () => void; onLogout: () => void }) {
-  const [unread, setUnread] = useState(0);
-  useEffect(() => {
-    sellerApi.notificationUnreadCount().then((r) => setUnread(Number(r.data?.unread_count ?? 0))).catch(() => setUnread(0));
-  }, []);
+function MoreScreen({ dash, notifUnread = 0, onReport, onOpenModule, onRefresh, onLogout }: { dash: DashboardData | null; notifUnread?: number; onReport: () => void; onOpenModule: (module: MoreModule) => void; onRefresh: () => void; onLogout: () => void }) {
   return (
     <>
       <SectionTitle title="Pharmacy profile" />
@@ -1474,7 +2149,7 @@ function MoreScreen({ dash, onReport, onOpenModule, onRefresh, onLogout }: { das
           ['pharmacy', '🏥', 'Pharmacy', 'DL · GST · bill header'],
           ['settings', '⚙️', 'Settings', 'Hours · delivery · alerts'],
           ['printer', '🖨️', 'Printer', 'Thermal 58 · half A4'],
-          ['notifications', '🔔', 'Alerts', unread ? `${unread} unread` : 'Inbox'],
+          ['notifications', '🔔', 'Alerts', notifUnread ? `${notifUnread} unread` : 'Inbox'],
           ['rx', '💊', 'Rx desk', 'Fill cart · message'],
           ['stock', '📦', 'Stock', 'Add · history · sold'],
           ['virtual', '🛍️', 'Virtual shop', 'Listing · discounts'],
@@ -1488,6 +2163,7 @@ function MoreScreen({ dash, onReport, onOpenModule, onRefresh, onLogout }: { das
             <Text style={s.moreTileIcon}>{icon}</Text>
             <Text style={s.moreTileTitle}>{title}</Text>
             <Text style={s.moreTileBody}>{body}</Text>
+            {key === 'notifications' && notifUnread > 0 ? <Text style={s.moreTileBadge}>{notifUnread > 99 ? '99+' : String(notifUnread)}</Text> : null}
           </TouchableOpacity>
         ))}
       </View>
@@ -1630,7 +2306,7 @@ function WholesaleScreen({ dash, canWholesale, onRefresh }: { dash: DashboardDat
   );
 }
 
-function MoreModuleScreen({ module, dash, onBack, onRefresh }: { module: MoreModule; dash: DashboardData | null; onBack: () => void; onRefresh: () => void }) {
+function MoreModuleScreen({ module, dash, onBack, onRefresh, onUnreadChange }: { module: MoreModule; dash: DashboardData | null; onBack: () => void; onRefresh: () => void; onUnreadChange?: (n: number) => void }) {
   const insets = useSafeAreaInsets();
   const title = module === 'pharmacy' ? 'Pharmacy Info'
     : module === 'settings' ? 'Store Settings'
@@ -1653,7 +2329,7 @@ function MoreModuleScreen({ module, dash, onBack, onRefresh }: { module: MoreMod
       <ScrollView contentContainerStyle={s.body}>
         {module === 'pharmacy' ? <PharmacyInfoScreen /> : null}
         {module === 'settings' ? <StoreSettingsScreen /> : null}
-        {module === 'notifications' ? <NotificationsScreen /> : null}
+        {module === 'notifications' ? <NotificationsScreen onUnreadChange={onUnreadChange} /> : null}
         {module === 'rx' ? <RxRequestsScreen /> : null}
         {module === 'stock' ? <StockManagementScreen /> : null}
         {module === 'virtual' ? <VirtualShopScreen /> : null}
@@ -1832,7 +2508,7 @@ function PrinterSettingsScreen({ dash }: { dash: DashboardData | null }) {
       <View style={s.heroCard}>
         <Text style={s.heroKicker}>Bill printing</Text>
         <Text style={s.bigTitle}>Same shop printer as the seller panel</Text>
-        <Text style={s.muted}>Pair the printer in Android Bluetooth settings, select it here, then print. Thermal bills go over Bluetooth with no extra blank paper after the tear.</Text>
+        <Text style={s.muted}>Pair the Milestone 523-L58P (or ESC/POS) printer in Android Bluetooth settings, select it here, set Language to tspl (default), Save, then Print sample. Same TSPL commands as the seller web panel.</Text>
       </View>
       <TouchableOpacity style={[s.choiceCard, (p.type || 'thermal_58') === 'thermal_58' && s.choiceCardOn]} onPress={() => updatePrinter({ type: 'thermal_58' })}>
         <Text style={s.itemTitle}>Thermal 58 mm</Text>
@@ -1861,26 +2537,121 @@ function PrinterSettingsScreen({ dash }: { dash: DashboardData | null }) {
   );
 }
 
-function NotificationsScreen() {
+function NotificationsScreen({ onUnreadChange }: { onUnreadChange?: (n: number) => void }) {
   const [items, setItems] = useState<SellerNotification[]>([]);
   const [loading, setLoading] = useState(true);
-  const [unreadOnly, setUnreadOnly] = useState(false);
+  const [filter, setFilter] = useState<NotifFilter>('all');
   const [error, setError] = useState('');
+  const [acting, setActing] = useState(false);
+
+  const publishUnread = useCallback((n: number) => {
+    onUnreadChange?.(n);
+    syncInboxBadgeCount(n).catch(() => undefined);
+  }, [onUnreadChange]);
+
   const load = useCallback(async () => {
     setLoading(true); setError('');
-    try { const res = await sellerApi.notifications(unreadOnly); setItems(res.data?.items ?? []); }
-    catch (err) { setError(errorMessage(err)); }
-    finally { setLoading(false); }
-  }, [unreadOnly]);
+    try {
+      const res = await sellerApi.notifications(false);
+      const list = res.data?.items ?? [];
+      setItems(list);
+      const unreadFromApi = res.data?.unread_count;
+      const unread = unreadFromApi != null
+        ? Number(unreadFromApi)
+        : list.filter((n) => !notificationIsRead(n)).length;
+      publishUnread(unread);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setLoading(false);
+    }
+  }, [publishUnread]);
+
   useEffect(() => { load(); }, [load]);
-  async function markRead(id: number) { await sellerApi.markNotificationRead(id); load(); }
-  async function markAll() { await sellerApi.markAllNotificationsRead(); load(); }
+
+  const filtered = useMemo(() => items.filter((n) => notificationMatchesFilter(n, filter)), [items, filter]);
+  const unreadCount = items.filter((n) => !notificationIsRead(n)).length;
+  const approvedCount = items.filter((n) => notificationDecisionStatus(n) === 'approved').length;
+  const rejectedCount = items.filter((n) => notificationDecisionStatus(n) === 'rejected').length;
+
+  async function markRead(id: number) {
+    if (acting) return;
+    setActing(true);
+    try {
+      const res = await sellerApi.markNotificationRead(id);
+      setItems((prev) => prev.map((n) => (n.id === id ? { ...n, is_read: true, read_at: n.read_at || new Date().toISOString() } : n)));
+      if (res.data?.unread_count != null) publishUnread(Number(res.data.unread_count));
+      else publishUnread(Math.max(0, unreadCount - 1));
+    } catch (err) {
+      Alert.alert('Notifications', errorMessage(err));
+    } finally {
+      setActing(false);
+    }
+  }
+
+  async function markAll() {
+    if (acting) return;
+    setActing(true);
+    try {
+      const res = await sellerApi.markAllNotificationsRead();
+      setItems((prev) => prev.map((n) => ({ ...n, is_read: true, read_at: n.read_at || new Date().toISOString() })));
+      publishUnread(Number(res.data?.unread_count ?? 0));
+    } catch (err) {
+      Alert.alert('Notifications', errorMessage(err));
+    } finally {
+      setActing(false);
+    }
+  }
+
   return <>
-    <View style={s.rowBetween}><TouchableOpacity style={[s.smallChip, unreadOnly && { backgroundColor: C.ink }]} onPress={() => setUnreadOnly(!unreadOnly)}><Text style={[s.smallChipText, unreadOnly && { color: '#FFF' }]}>Unread only</Text></TouchableOpacity><Secondary label="Read all" compact onPress={markAll} /></View>
+    <Segment<NotifFilter>
+      value={filter}
+      options={[
+        ['all', `All (${items.length})`],
+        ['approved', `Approved (${approvedCount})`],
+        ['rejected', `Rejected (${rejectedCount})`],
+      ]}
+      onChange={setFilter}
+      dark
+    />
+    <View style={s.rowBetween}>
+      <Text style={s.count}>{unreadCount > 0 ? `${unreadCount} unread` : 'All caught up'} · {filtered.length} shown</Text>
+      {unreadCount > 0 ? <Secondary label="Read all" compact onPress={markAll} disabled={acting} /> : null}
+    </View>
     {loading ? <CenteredLoader compact /> : null}
     {error ? <Notice tone="error" title="Could not load notifications" body={error} /> : null}
-    {items.map((n) => <TouchableOpacity key={n.id} style={s.card} onPress={() => markRead(n.id)}><View style={s.rowBetween}><Text style={s.itemTitle}>{n.title || n.category || 'Notification'}</Text>{n.is_read ? <Pill text="Read" /> : <Pill text="Unread" tone="orange" />}</View><Text style={s.muted}>{n.message || n.body || '-'}</Text><Text style={s.footer}>{prettyDate(n.created_at)}</Text></TouchableOpacity>)}
-    {!loading && !items.length ? <Empty title="No notifications" body="Admin approvals and platform alerts will appear here." /> : null}
+    {filtered.map((n) => {
+      const unread = !notificationIsRead(n);
+      const decision = notificationDecisionStatus(n);
+      return (
+        <TouchableOpacity
+          key={n.id}
+          style={[s.card, unread ? s.notifCardUnread : s.notifCardRead]}
+          onPress={() => { if (unread) markRead(n.id); }}
+          activeOpacity={0.85}
+        >
+          <View style={s.rowBetween}>
+            <Text style={[s.itemTitle, { flex: 1 }]}>{n.title || n.category || n.type || 'Notification'}</Text>
+            {decision === 'approved' ? <Pill text="Approved" tone="green" /> : null}
+            {decision === 'rejected' ? <Pill text="Rejected" tone="red" /> : null}
+            {decision === 'expired' ? <Pill text="Expired" tone="orange" /> : null}
+            {!decision && unread ? <Pill text="Unread" tone="orange" /> : null}
+            {!decision && !unread ? <Pill text="Read" /> : null}
+          </View>
+          <Text style={s.muted}>{n.message || n.body || '-'}</Text>
+          <View style={s.rowBetween}>
+            <Text style={s.footer}>{prettyDate(n.created_at)}</Text>
+            {unread ? <Text style={s.notifMarkHint}>Tap to mark read</Text> : <Text style={s.notifMarkHint}>Read</Text>}
+          </View>
+        </TouchableOpacity>
+      );
+    })}
+    {!loading && !filtered.length ? (
+      <Empty
+        title={filter === 'approved' ? 'No approved product alerts' : filter === 'rejected' ? 'No rejected product alerts' : 'No notifications'}
+        body="Admin product approvals and platform alerts sync with the seller panel inbox."
+      />
+    ) : null}
   </>;
 }
 
@@ -1893,6 +2664,7 @@ function RxRequestsScreen() {
   const [cart, setCart] = useState<Array<{ product_id: number; name: string; quantity: number }>>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [rxImageOpen, setRxImageOpen] = useState(false);
   const load = useCallback(async () => {
     setLoading(true); setError('');
     try { const res = await sellerApi.rxRequests(); setItems(res.data?.items ?? []); }
@@ -1922,7 +2694,18 @@ function RxRequestsScreen() {
   }
   if (selected) return <>
     <TouchableOpacity onPress={() => setSelected(null)}><Text style={s.backText}>‹ Requests</Text></TouchableOpacity>
-    <View style={s.card}><Text style={s.itemTitle}>{selected.customer_name || 'Customer'} Rx</Text><Text style={s.muted}>{selected.status || '-'} • {prettyDate(selected.created_at)}</Text>{selected.prescription_url ? <Image source={{ uri: mediaUrl(selected.prescription_url) }} style={s.rxImage} resizeMode="contain" /> : null}</View>
+    <View style={s.card}>
+      <Text style={s.itemTitle}>{selected.customer_name || 'Customer'} Rx</Text>
+      <Text style={s.muted}>{selected.status || '-'} • {prettyDate(selected.created_at)}</Text>
+      {selected.prescription_url ? (
+        <TouchableOpacity activeOpacity={0.9} onPress={() => setRxImageOpen(true)}>
+          <Image source={{ uri: mediaUrl(selected.prescription_url) }} style={s.rxImage} resizeMode="contain" />
+          <Text style={s.tapHint}>Tap prescription to rotate, zoom and view fullscreen</Text>
+        </TouchableOpacity>
+      ) : null}
+    </View>
+    <RxImageViewer uri={mediaUrl(selected.prescription_url)} visible={rxImageOpen} onClose={() => setRxImageOpen(false)} />
+    <CustomerRxDetailsCard source={selected} />
     <Field label="Message / seller notes" value={note} onChangeText={setNote} multiline />
     <SearchBox placeholder="Search medicine from catalog" value={search} onChangeText={searchCatalog} />
     {results.slice(0, 6).map((p) => {
@@ -1936,14 +2719,14 @@ function RxRequestsScreen() {
   return <>
     {loading ? <CenteredLoader compact /> : null}
     {error ? <Notice tone="error" title="Could not load Rx requests" body={error} /> : null}
-    {items.map((rx) => <MenuItem key={rx.id} title={rx.customer_name || `Rx #${rx.id}`} body={`${rx.status || 'pending'} • ${prettyDate(rx.created_at)}`} badge={rx.status || undefined} onPress={async () => {
+    {items.map((rx) => <MenuItem key={rx.id} title={rx.customer_name || `Rx #${rx.id}`} body={`${rx.status || 'pending'} • ${prettyDate(rx.created_at)}${hasCustomerRxDetails(rx) ? ` • ${parseCustomerRxDetails(rx).map((line) => `${line.label}: ${line.value}`).join(' · ')}` : ''}`} badge={rx.status || undefined} onPress={async () => {
       setSelected(rx);
-      setNote(rx.notes || '');
+      setNote(rx.seller_notes || '');
       try {
         const detail = await sellerApi.rxRequestDetail(rx.id);
         if (detail.data) {
           setSelected(detail.data);
-          setNote(detail.data.notes || detail.data.message || '');
+          setNote(detail.data.seller_notes || '');
         }
       } catch { /* list row is enough to continue */ }
     }} />)}
@@ -2180,16 +2963,88 @@ function PayoutsScreen() {
   </>;
 }
 
+function RxImageViewer({ uri, visible, onClose }: { uri?: string | null; visible: boolean; onClose: () => void }) {
+  const insets = useSafeAreaInsets();
+  const { width, height } = useWindowDimensions();
+  const [rotation, setRotation] = useState(0);
+  const [zoom, setZoom] = useState(1);
+  const pan = useRef(new Animated.ValueXY({ x: 0, y: 0 })).current;
+  const zoomRef = useRef(1);
+  zoomRef.current = zoom;
+
+  useEffect(() => {
+    if (!visible) {
+      setRotation(0);
+      setZoom(1);
+      pan.setValue({ x: 0, y: 0 });
+    }
+  }, [visible, pan]);
+
+  const panResponder = useMemo(() => PanResponder.create({
+    onMoveShouldSetPanResponder: (_evt, gesture) => zoomRef.current > 1 && (Math.abs(gesture.dx) > 4 || Math.abs(gesture.dy) > 4),
+    onPanResponderMove: Animated.event([null, { dx: pan.x, dy: pan.y }], { useNativeDriver: false }),
+    onPanResponderRelease: () => {
+      if (zoomRef.current <= 1) pan.setValue({ x: 0, y: 0 });
+    },
+  }), [pan]);
+
+  function resetView() {
+    setRotation(0);
+    setZoom(1);
+    pan.setValue({ x: 0, y: 0 });
+  }
+
+  const sideways = rotation % 180 !== 0;
+  const imageWidth = sideways ? height * 0.72 : width;
+  const imageHeight = sideways ? width : height * 0.72;
+
+  return (
+    <Modal visible={visible} animationType="fade" onRequestClose={onClose}>
+      <View style={[s.imageViewer, { paddingTop: insets.top, paddingBottom: Math.max(insets.bottom, 12) }]}>
+        <View style={s.rxViewerTop}>
+          <TouchableOpacity style={s.imageClose} onPress={onClose}>
+            <Text style={s.imageCloseText}>Close</Text>
+          </TouchableOpacity>
+        </View>
+        <View style={s.rxViewerStage} {...panResponder.panHandlers}>
+          {uri ? (
+            <Animated.View style={{ transform: [...pan.getTranslateTransform(), { scale: zoom }, { rotate: `${rotation}deg` }] }}>
+              <Image source={{ uri }} style={{ width: imageWidth, height: imageHeight }} resizeMode="contain" />
+            </Animated.View>
+          ) : null}
+        </View>
+        <View style={s.rxViewerTools}>
+          <TouchableOpacity style={s.rxToolBtn} onPress={() => setRotation((value) => (value + 90) % 360)}>
+            <Text style={s.rxToolText}>Rotate</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={s.rxToolBtn} onPress={() => setZoom((value) => Math.min(4, Math.round((value + 0.5) * 10) / 10))}>
+            <Text style={s.rxToolText}>Zoom +</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={s.rxToolBtn} onPress={() => setZoom((value) => {
+            const next = Math.max(1, Math.round((value - 0.5) * 10) / 10);
+            if (next <= 1) pan.setValue({ x: 0, y: 0 });
+            return next;
+          })}>
+            <Text style={s.rxToolText}>Zoom −</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={s.rxToolBtn} onPress={resetView}>
+            <Text style={s.rxToolText}>Reset</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
 function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: DashboardData | null; onBack: () => void }) {
   const insets = useSafeAreaInsets();
-  const [detail, setDetail] = useState(order);
+  const [detail, setDetail] = useState(() => withNearbyForward(order));
   const [notes, setNotes] = useState(order.seller_notes || '');
   const [acting, setActing] = useState(false);
   const [fulfill, setFulfill] = useState<Record<number, string>>({});
   const [rxRows, setRxRows] = useState<RxMedicineRow[]>([{ name: '', qty: '1', price: '' }]);
   const [rxSuggest, setRxSuggest] = useState<Record<number, CatalogSuggestion[]>>({});
   const [rxImageOpen, setRxImageOpen] = useState(false);
-  const [forward, setForward] = useState<Record<number, { qty: string; pharmacyId: string }>>({});
   const [invoice, setInvoice] = useState<OrderDetail['invoice']>(order.invoice ?? null);
   const [showInvoice, setShowInvoice] = useState(false);
 
@@ -2199,17 +3054,16 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
     setFulfill(next);
   }, [detail.id]);
 
+  useEffect(() => {
+    setDetail(withNearbyForward(order));
+    ensureNearbyForward(order).then(setDetail).catch(() => undefined);
+  }, [order]);
+
   async function reload() {
     const res = await sellerApi.orderDetail(detail.id);
     if (res.data) {
-      const next = res.data;
-      if (!next.forward_pharmacies?.length) {
-        try {
-          const fwd = await sellerApi.forwardPharmacies(next.pincode || undefined);
-          next.forward_pharmacies = fwd.data?.items ?? [];
-        } catch { /* order can still be processed without forward list */ }
-      }
-      setDetail(next);
+      const merged = applyRejectedStatus(keepSellerAck(detail, res.data));
+      setDetail(await ensureNearbyForward(merged));
     }
   }
 
@@ -2242,15 +3096,63 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
   }
 
   async function run(code: string) {
+    if (code === 'confirmed' || code === 'rx_accept') stopSellerAlertNow(detail.id);
     setActing(true);
     try {
-      await sellerApi.orderAction(detail.id, code);
-      await cancelOrderNotification(detail.id);
-      setDetail((current) => current ? { ...current, status: code === 'rx_accept' ? 'confirmed' : code, seller_confirmed_at: new Date().toISOString() } : current);
-      await reload();
       if (code === 'ready_for_pickup') {
-        const prefs = await readPrefs();
-        if (prefs.autoPrint) await printCurrentBill().catch(() => undefined);
+        const res = await markOrderReadyOnce(detail.id, detail.status);
+        await cancelOrderNotification(detail.id);
+        const nextStatus = typeof res.data?.status === 'string' ? String(res.data.status) : 'ready_for_pickup';
+        setDetail((current) => current ? { ...current, status: nextStatus } : current);
+        await reload();
+        if (!res.skipped) {
+          const prefs = await readPrefs();
+          if (prefs.autoPrint) await printCurrentBill().catch(() => undefined);
+          if (res.auto_assigned) Alert.alert('Ready', 'Delivery partner auto-assigned');
+          else Alert.alert('Ready', 'Marked ready for pickup — delivery partners notified');
+        }
+        onBack();
+        return;
+      }
+      const message = decisionActionMessage(code) || (code === 'rejected' ? 'Rejected by pharmacy' : code === 'wrong_prescription' ? 'Wrong prescription' : undefined);
+      let res: ApiWrap<Record<string, unknown>>;
+      try {
+        res = await sellerApi.orderAction(detail.id, code, message);
+      } catch (err) {
+        const msg = errorMessage(err);
+        if (/already accepted/i.test(msg)) {
+          res = { success: true, data: { order_id: detail.id, already: true, status: detail.status || 'prescription_review', seller_confirmed_at: detail.seller_confirmed_at || new Date().toISOString() } };
+        } else if (code === 'rx_accept' && /only prescription review/i.test(msg)) {
+          res = await sellerApi.orderAction(detail.id, 'confirmed', readyActionMessage('confirmed'));
+        } else {
+          throw err;
+        }
+      }
+      await cancelOrderNotification(detail.id);
+      const confirmedAt = typeof res.data?.seller_confirmed_at === 'string' && res.data.seller_confirmed_at
+        ? String(res.data.seller_confirmed_at)
+        : new Date().toISOString();
+      const nextStatus = code === 'rx_accept'
+        ? (typeof res.data?.status === 'string' ? String(res.data.status) : 'prescription_review')
+        : (typeof res.data?.status === 'string' ? String(res.data.status) : code);
+      setDetail((current) => current ? {
+        ...current,
+        status: nextStatus,
+        seller_confirmed_at: code === 'rx_accept' || code === 'confirmed' ? (current.seller_confirmed_at || confirmedAt) : current.seller_confirmed_at,
+      } : current);
+      const latest = await sellerApi.orderDetail(detail.id).catch(() => null);
+      if (latest?.data) {
+        setDetail(await ensureNearbyForward(keepSellerAck({
+          ...detail,
+          seller_confirmed_at: code === 'rx_accept' || code === 'confirmed' ? confirmedAt : detail.seller_confirmed_at,
+        }, latest.data)));
+      }
+      if (code === 'rx_accept' || code === 'confirmed') {
+        Alert.alert('Order accepted');
+      } else if (code === 'rejected' || code === 'wrong_prescription') {
+        await rememberRejectedOrder(rejectedLocalOrder(detail, detail.id));
+        setDetail((current) => current ? { ...current, status: 'rejected' } : current);
+        Alert.alert('Order rejected');
         onBack();
       }
     } catch (err) {
@@ -2260,28 +3162,49 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
     }
   }
 
+  function processPayload(finalStatus: string) {
+    return {
+      order_id: detail.id,
+      seller_notes: notes,
+      final_status: finalStatus,
+      items: (detail.items ?? []).map((item) => ({
+        order_item_id: item.id,
+        fulfill_qty: Number(fulfill[item.id] || 0),
+      })),
+    };
+  }
+
   async function process(finalStatus: string) {
+    if (finalStatus === 'confirmed') stopSellerAlertNow(detail.id);
     setActing(true);
     try {
-      await sellerApi.processOrder({
-        order_id: detail.id,
-        seller_notes: notes,
-        final_status: finalStatus,
-        items: (detail.items ?? []).map((item) => ({
-          order_item_id: item.id,
-          fulfill_qty: Number(fulfill[item.id] || 0),
-          forward_qty: Number(forward[item.id]?.qty || 0),
-          forward_to_pharmacy_id: Number(forward[item.id]?.pharmacyId || 0),
-        })),
-      });
+      // Panel: Accept = process(confirmed); Ready = orders/action ONLY (never process ready —
+      // and never POST ready twice — each ready clears delivery_agent_id / exclusive offer).
+      if (finalStatus === 'ready_for_pickup') {
+        if (pendingStatus(detail.status)) {
+          await sellerApi.processOrder(processPayload('confirmed'));
+          await cancelOrderNotification(detail.id);
+          setDetail((current) => current ? { ...current, status: 'confirmed', seller_confirmed_at: current.seller_confirmed_at || new Date().toISOString() } : current);
+        }
+        const res = await markOrderReadyOnce(detail.id, pendingStatus(detail.status) ? 'confirmed' : detail.status);
+        const nextStatus = typeof res.data?.status === 'string' ? String(res.data.status) : 'ready_for_pickup';
+        setDetail((current) => current ? { ...current, status: nextStatus, seller_confirmed_at: current.seller_confirmed_at || new Date().toISOString() } : current);
+        await reload();
+        if (!res.skipped) {
+          const prefs = await readPrefs();
+          if (prefs.autoPrint) await printCurrentBill().catch(() => undefined);
+          if (res.auto_assigned) Alert.alert('Ready', 'Delivery partner auto-assigned');
+          else Alert.alert('Ready', 'Marked ready for pickup — delivery partners notified');
+        }
+        onBack();
+        return;
+      }
+      await sellerApi.processOrder(processPayload(finalStatus));
       await cancelOrderNotification(detail.id);
       setDetail((current) => current ? { ...current, status: finalStatus, seller_confirmed_at: current.seller_confirmed_at || new Date().toISOString() } : current);
+      if (finalStatus === 'rejected') await rememberRejectedOrder(rejectedLocalOrder(detail, detail.id));
       await reload();
-      if (finalStatus === 'ready_for_pickup') {
-        const prefs = await readPrefs();
-        if (prefs.autoPrint) await printCurrentBill().catch(() => undefined);
-      }
-      if (finalStatus === 'ready_for_pickup' || finalStatus === 'rejected') onBack();
+      if (finalStatus === 'rejected') onBack();
     } catch (err) {
       Alert.alert('Order', errorMessage(err));
     } finally {
@@ -2290,16 +3213,52 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
   }
 
   async function submitRx() {
-    const items = rxRows.filter((r) => r.name.trim()).map((r) => ({ product_id: r.product_id, medicine_name: r.name.trim(), quantity: Number(r.qty || 1), fulfill_qty: Number(r.qty || 1), price: Number(r.price || 0), disposition: 'fulfill' }));
+    const requiredLines = rxSelectionLineNumbers(detail.notes);
+    const filled = rxRows.filter((r) => r.name.trim());
+    const items = filled.map((r, idx) => ({
+      product_id: r.product_id,
+      medicine_name: r.name.trim(),
+      quantity: Number(r.qty || 1),
+      fulfill_qty: Number(r.qty || 1),
+      price: Number(r.price || 0),
+      disposition: 'fulfill' as const,
+      ...(requiredLines[idx] ? { rx_line_number: requiredLines[idx] } : {}),
+    }));
     if (!items.length) return Alert.alert('Prescription', 'Add medicines you will supply.');
     setActing(true);
     try {
-      const res = await sellerApi.prescriptionFill({ order_id: detail.id, items, seller_notes: notes, final_status: 'confirmed' });
+      const res = await sellerApi.prescriptionFill({
+        order_id: detail.id,
+        items,
+        seller_notes: notes,
+        final_status: 'confirmed',
+        instructions_reviewed: true,
+      });
       await cancelOrderNotification(detail.id);
       if (res.data) setDetail(res.data);
       else setDetail((current) => current ? { ...current, status: 'confirmed', seller_confirmed_at: new Date().toISOString() } : current);
     } catch (err) {
-      Alert.alert('Prescription', errorMessage(err));
+      const msg = errorMessage(err);
+      if (/review the requested duration/i.test(msg)) {
+        // Live PHP requires this flag; never surface it as a blocking "OK" dialog.
+        try {
+          const res = await sellerApi.prescriptionFill({
+            order_id: detail.id,
+            items,
+            seller_notes: notes,
+            final_status: 'confirmed',
+            instructions_reviewed: true,
+          });
+          await cancelOrderNotification(detail.id);
+          if (res.data) setDetail(res.data);
+          else setDetail((current) => current ? { ...current, status: 'confirmed', seller_confirmed_at: new Date().toISOString() } : current);
+          return;
+        } catch (retryErr) {
+          Alert.alert('Prescription', errorMessage(retryErr));
+          return;
+        }
+      }
+      Alert.alert('Prescription', msg);
     } finally {
       setActing(false);
     }
@@ -2355,24 +3314,36 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
     });
   }
 
-  const pending = pendingStatus(detail.status);
+  const pending = pendingStatus(detail.status) && !isOrderRejected(detail.id);
   const rx = detail.is_prescription_order || isPrescription(detail);
+  const decisions = orderDecisionActions(detail);
+  const rejected = isOrderRejected(detail.id) || ['rejected', 'cancelled'].includes(orderStatusKey(detail.status));
   return (
     <View style={[s.screen, { paddingTop: insets.top }]}>
       <Header title={rx ? 'Prescription Order' : detail.order_number} subtitle={detail.status.replace(/_/g, ' ')} onRefresh={reload} onLogout={onBack} />
-      <ScrollView contentContainerStyle={s.body}>
-        <TouchableOpacity onPress={onBack}><Text style={s.backText}>‹ Back to orders</Text></TouchableOpacity>
-        <OrderStepper status={detail.status} />
-        {isVirtualShop(detail) ? <VirtualShopBanner order={detail} /> : null}
-        <View style={s.card}>
-          <Text style={s.itemTitle}>{detail.customer_name || 'Customer'} • {detail.customer_phone || '-'}</Text>
-          <Text style={s.muted}>{[detail.address_line, detail.city, detail.pincode].filter(Boolean).join(', ')}</Text>
-          <View style={s.rowBetween}><Text style={s.amount}>Total {money(detail.total_amount)}</Text>{detail.payment_method ? <Pill text={detail.payment_method.toUpperCase()} tone="blue" /> : null}</View>
-        </View>
+      <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined} keyboardVerticalOffset={insets.top + 8}>
+        <ScrollView contentContainerStyle={[s.body, { paddingBottom: 40 + Math.max(insets.bottom, 12) }]} keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag">
+          <TouchableOpacity onPress={onBack}><Text style={s.backText}>‹ Back to orders</Text></TouchableOpacity>
+          <OrderStepper status={detail.status} />
+          {isVirtualShop(detail) ? <VirtualShopBanner order={detail} /> : null}
+          <View style={s.card}>
+            <Text style={s.itemTitle}>{detail.customer_name || 'Customer'} • {detail.customer_phone || '-'}</Text>
+            <Text style={s.muted}>{[detail.address_line, detail.city, detail.pincode].filter(Boolean).join(', ')}</Text>
+            <View style={s.rowBetween}><Text style={s.amount}>Total {money(detail.total_amount)}</Text>{detail.payment_method ? <Pill text={detail.payment_method.toUpperCase()} tone="blue" /> : null}</View>
+          </View>
+          {pending ? <SilenceBell orderId={detail.id} /> : null}
+          {rx && hasSellerConfirmedAt(detail.seller_confirmed_at) ? (
+            <Notice tone="success" title="Order accepted" body="Preparing, ready, fill and print stay on the seller web panel." />
+          ) : !rx && !pending && ['confirmed', 'preparing'].includes(orderStatusKey(detail.status)) ? (
+            <Notice tone="success" title="Order accepted" body="Preparing, ready, fill and print stay on the seller web panel." />
+          ) : rejected ? (
+            <Notice tone="error" title="Order rejected" body="" />
+          ) : null}
+          <CustomerRxDetailsCard source={detail} />
         {rx && mediaUrl(detail.prescription_url) ? (
           <TouchableOpacity activeOpacity={0.9} onPress={() => setRxImageOpen(true)}>
             <Image source={{ uri: mediaUrl(detail.prescription_url) }} style={s.rxImage} resizeMode="contain" />
-            <Text style={s.tapHint}>Tap prescription to view fullscreen</Text>
+            <Text style={s.tapHint}>Tap prescription to rotate, zoom and view fullscreen</Text>
           </TouchableOpacity>
         ) : null}
         {detail.tracking?.length ? (
@@ -2381,97 +3352,27 @@ function OrderDetailScreen({ order, dash, onBack }: { order: OrderDetail; dash: 
             <View style={s.card}>{detail.tracking.map((t, idx) => <Info key={`${t.status}-${idx}`} label={t.status?.replace(/_/g, ' ') || 'Update'} value={`${t.message || ''} ${prettyDate(t.created_at)}`} />)}</View>
           </>
         ) : null}
-        <SectionTitle title={rx ? 'Medicines' : 'Line items'} right={pending && !rx ? 'Set fulfill qty' : undefined} />
-        {rx && pending ? (
+        {(detail.items ?? []).length ? (
           <>
-            {rxRows.map((row, idx) => (
-              <View key={idx} style={s.card}>
-                <Field label="Medicine name" value={row.name} onChangeText={(v) => searchRxCatalog(idx, v)} />
-                {(rxSuggest[idx] ?? []).slice(0, 5).map((product) => (
-                  <TouchableOpacity key={product.product_id ?? product.id ?? product.name} style={s.suggestionRow} onPress={() => chooseRxProduct(idx, product)}>
-                    <View style={{ flex: 1 }}>
-                      <Text style={s.itemTitle}>{product.name}</Text>
-                      <Text style={s.muted}>{product.seller_stock ?? 0} available</Text>
-                    </View>
-                    <Text style={s.itemPrice}>{money(product.price)}</Text>
-                  </TouchableOpacity>
-                ))}
-                {row.name.trim().length >= 2 && !(rxSuggest[idx] ?? []).length ? <Text style={s.muted}>No catalog match yet. Check spelling or add another medicine name.</Text> : null}
-                <View style={s.inputRow}>
-                  <Field label="Qty" value={row.qty} onChangeText={(v) => updateRxRow(idx, { qty: v.replace(/\D/g, '') })} keyboardType="number-pad" compact />
-                  <Field label="Price" value={row.price} onChangeText={(v) => updateRxRow(idx, { price: v.replace(/[^0-9.]/g, '') })} keyboardType="decimal-pad" compact />
-                </View>
+            <SectionTitle title={rx ? 'Medicines' : 'Line items'} />
+            {detail.items?.map((item) => (
+              <View key={item.id} style={s.card}>
+                <Text style={s.itemTitle}>{item.product_name || 'Item'}</Text>
+                <Text style={s.muted}>Ordered {item.quantity ?? 0} • {money(item.price)}</Text>
               </View>
             ))}
-            <Secondary label="Add medicine I have" onPress={() => setRxRows((rows) => [...rows, { name: '', qty: '1', price: '' }])} />
           </>
-        ) : (
-          detail.items?.map((item) => (
-            <View key={item.id} style={s.card}>
-              <Text style={s.itemTitle}>{item.product_name || 'Item'}</Text>
-              <Text style={s.muted}>Ordered {item.quantity ?? 0} • {item.catalog_note || 'New on confirm'} • {money(item.price)}</Text>
-              {pending && !rx ? <Field label="Fulfill" value={fulfill[item.id] || '0'} onChangeText={(v) => setFulfill((m) => ({ ...m, [item.id]: v.replace(/\D/g, '') }))} keyboardType="number-pad" compact /> : null}
-              {pending && !rx && (detail.forward_pharmacies?.length || dash?.pharmacy) ? (
-                <View style={s.inputRow}>
-                  <Field label="Forward qty" value={forward[item.id]?.qty || ''} onChangeText={(v) => setForward((m) => ({ ...m, [item.id]: { qty: v.replace(/\D/g, ''), pharmacyId: m[item.id]?.pharmacyId || String(detail.forward_pharmacies?.[0]?.id || '') } }))} compact />
-                  <Field
-                    label="Forward pharmacy id"
-                    value={forward[item.id]?.pharmacyId || String(detail.forward_pharmacies?.[0]?.id || '')}
-                    onChangeText={(v) => setForward((m) => ({ ...m, [item.id]: { qty: m[item.id]?.qty || '', pharmacyId: v.replace(/\D/g, '') } }))}
-                    compact
-                  />
-                </View>
-              ) : null}
-            </View>
-          ))
-        )}
-        {detail.forward_pharmacies?.length ? (
-          <View style={s.card}>
-            <Text style={s.itemTitle}>Nearby pharmacies to forward</Text>
-            {detail.forward_pharmacies.map((p) => <Text key={p.id} style={s.muted}>#{p.id} {p.name} • {p.city || p.nearby_label || ''} {p.distance_km != null ? `• ${p.distance_km} km` : ''}</Text>)}
-          </View>
+        ) : rx ? (
+          <Text style={s.muted}>No line items yet. Complete fill on the seller web panel.</Text>
         ) : null}
-        <Field label="Notes to customer" value={notes} onChangeText={setNotes} multiline />
-        <View style={s.inputRow}>
-          <Secondary label={showInvoice ? 'Hide invoice' : 'View invoice'} compact onPress={() => (showInvoice ? setShowInvoice(false) : loadInvoice())} />
-          <Primary label="Print bill" compact onPress={() => printCurrentBill().catch((err) => Alert.alert('Print', err instanceof Error ? err.message : errorMessage(err)))} />
-        </View>
-        <Secondary label="Share bill PDF" onPress={() => {
-          const layout = 'thermal_58' as PrinterLayout;
-          shareBillPdf({ ...detail, invoice }, layout, dash?.pharmacy).catch((err) => Alert.alert('Bill', errorMessage(err)));
-        }} />
-        {showInvoice && invoice ? (
-          <View style={s.card}>
-            <Text style={s.itemTitle}>Invoice</Text>
-            {invoice.lines?.map((line, idx) => <Text key={idx} style={s.muted}>{line.name} × {line.quantity ?? 0} = {money(line.line_total ?? line.price)}</Text>)}
-            <Text style={s.amount}>Subtotal {money(invoice.subtotal)} • Delivery {money(invoice.delivery_fee)} • Total {money(invoice.total_amount)}</Text>
-          </View>
-        ) : null}
-        {pending && rx && detail.status === 'prescription_review' && !detail.seller_confirmed_at ? (
-          <Primary label={acting ? 'Accepting...' : 'Accept Prescription'} disabled={acting} onPress={() => run('rx_accept')} />
-        ) : null}
-        {pending && rx ? <Primary label={acting ? 'Saving...' : 'Fill prescription & confirm'} disabled={acting} onPress={submitRx} /> : null}
-        {pending && rx ? <Secondary label={acting ? 'Sending...' : 'Send catalog items to cart'} disabled={acting} onPress={sendRxToCart} /> : null}
-        {rx ? <Secondary label="Message customer" disabled={acting} onPress={sendOrderMessage} /> : null}
-        {pending && !rx ? (
-          <>
-            <Primary label="Confirm & Save" disabled={acting} onPress={() => process('confirmed')} />
-            <Primary label="Confirm & Ready for Pickup" disabled={acting} onPress={() => process('ready_for_pickup')} />
-            <Secondary label="Confirm & Start Preparing" disabled={acting} onPress={() => process('preparing')} />
-            <Danger label="Reject order" disabled={acting} onPress={() => process('rejected')} />
-          </>
-        ) : null}
-        {pending && rx ? <Danger label="Wrong prescription" disabled={acting} onPress={() => run('wrong_prescription')} /> : null}
-        {!pending && quickActions(detail.status).map((a) => <Primary key={a.code} label={a.label} disabled={acting} onPress={() => run(a.code)} />)}
-      </ScrollView>
-      <Modal visible={rxImageOpen} animationType="fade" onRequestClose={() => setRxImageOpen(false)}>
-        <View style={s.imageViewer}>
-          <TouchableOpacity style={s.imageClose} onPress={() => setRxImageOpen(false)}>
-            <Text style={s.imageCloseText}>Close</Text>
-          </TouchableOpacity>
-          {mediaUrl(detail.prescription_url) ? <Image source={{ uri: mediaUrl(detail.prescription_url) }} style={s.fullRxImage} resizeMode="contain" /> : null}
-        </View>
-      </Modal>
+        {decisions.map((a) => (
+          a.code === 'rejected' || a.code === 'wrong_prescription'
+            ? <Danger key={a.code} label={acting ? 'Saving...' : a.label} disabled={acting} onPress={() => run(a.code)} />
+            : <Primary key={a.code} label={acting ? 'Saving...' : a.label} disabled={acting} onPress={() => run(a.code)} />
+        ))}
+        </ScrollView>
+      </KeyboardAvoidingView>
+      <RxImageViewer uri={mediaUrl(detail.prescription_url)} visible={rxImageOpen} onClose={() => setRxImageOpen(false)} />
     </View>
   );
 }
@@ -2624,7 +3525,11 @@ function SettingsPanel() {
     setAutoPrint(value.autoPrint);
     writeSellerPrefs(value).catch(() => undefined);
     setOrderWatchSound(value.sound);
-    if (!value.sound) syncPendingOrderNotifications([]).catch(() => undefined);
+    setSellerRingSound(value.sound);
+    if (!value.sound) {
+      dismissSellerRing();
+      syncPendingOrderNotifications([]).catch(() => undefined);
+    }
   }
   return (
     <>
@@ -2688,13 +3593,18 @@ function OrderCard({ order, onOpen, onAction }: { order: Order; onOpen: () => vo
         <View style={[s.pill, { backgroundColor: tone.bg, minWidth: 120 }]}><Text style={[s.pillText, { color: tone.fg }]}>{tone.label}</Text></View>
       </View>
       {isPrescription(order) ? <Text style={s.rxBadge}>Prescription order</Text> : null}
+      {hasCustomerRxDetails(order) ? (
+        <Text style={s.rxExtrasPreview} numberOfLines={3}>
+          {parseCustomerRxDetails(order).map((line) => `${line.label}: ${line.value}`).join(' · ')}
+        </Text>
+      ) : null}
       {isVirtualShop(order) ? <VirtualShopBanner order={order} compact /> : null}
       <View style={s.rowBetween}>
         <View style={{ flex: 1 }}>
           <Text style={s.customer}>{order.customer_name || 'Customer'}</Text>
           <Text style={s.muted}>{[order.address_line, order.city].filter(Boolean).join(', ')}</Text>
         </View>
-        <Text style={s.orderAmount}>{money(order.total_amount)}</Text>
+        <Text style={s.orderAmount}>{money(orderBillAmount(order) || order.total_amount)}</Text>
       </View>
       <View style={s.actionRow}>
         {order.payment_method ? <Pill text={order.payment_method.toUpperCase()} /> : null}
@@ -2722,6 +3632,43 @@ function ProductRow({ item, onPress }: { item: InventoryItem; onPress: () => voi
   );
 }
 
+function SilenceBell({ orderId }: { orderId: number }) {
+  const [muted, setMuted] = useState(isOrderMuted(orderId));
+  useEffect(() => {
+    setMuted(isOrderMuted(orderId));
+    return subscribeMutedOrders(() => setMuted(isOrderMuted(orderId)));
+  }, [orderId]);
+
+  async function toggleMute() {
+    if (muted) {
+      setMuted(false);
+      void unmuteOrder(orderId);
+      const prefs = await readPrefs();
+      if (prefs.sound) void startOrderBell(true);
+    } else {
+      setMuted(true);
+      await muteOrder(orderId).catch(() => undefined);
+      silenceNativeOrder(orderId);
+      silenceOrderAlert(orderId);
+      await stopOrderBell();
+      await cancelOrderNotification(orderId);
+    }
+  }
+
+  return (
+    <Pressable
+      onPress={toggleMute}
+      accessibilityRole="button"
+      accessibilityLabel={muted ? 'Unmute order bell' : 'Silence order ring'}
+      hitSlop={12}
+      style={s.popupBellButton}
+    >
+      <Text style={s.popupBell}>{muted ? '🔕' : '🔔'}</Text>
+      <Text style={s.popupBellHint}>{muted ? 'Ring silenced — tap to ring' : 'Tap bell to silence ring'}</Text>
+    </Pressable>
+  );
+}
+
 function FreshBanner({ order, onOpen, onClose }: { order: Order; onOpen: () => void; onClose: () => void }) {
   return (
     <TouchableOpacity style={s.freshBanner} onPress={onOpen}>
@@ -2731,19 +3678,61 @@ function FreshBanner({ order, onOpen, onClose }: { order: Order; onOpen: () => v
   );
 }
 
-function NewOrderPopup({ order, onOpen, onClose }: { order: Order | null; onOpen: () => void; onClose: () => void }) {
+function NewOrderPopup({
+  order,
+  outcome,
+  onOpen,
+  onClose,
+  onAction,
+}: {
+  order: Order | null;
+  outcome?: 'accepted' | 'rejected' | null;
+  onOpen: () => void;
+  onClose: () => void;
+  onAction: (code: string) => void;
+}) {
+  const rejected = Boolean(order && (isOrderRejected(order.id) || ['rejected', 'cancelled'].includes(String(order.status || '').toLowerCase()) || outcome === 'rejected'));
+  const decisions = order && !outcome && !rejected ? popupDecisionActions(order) : [];
+  const rxLines = order ? parseCustomerRxDetails(order) : [];
+  const bill = orderBillAmount(order);
+  const who = orderCustomerName(order?.customer_name) || 'Customer';
   return (
     <Modal visible={Boolean(order)} transparent animationType="fade" onRequestClose={onClose}>
       <View style={s.modalShade}>
-        <View style={s.newOrderModal}>
-          <Image source={LOGO} style={s.authLogo} resizeMode="contain" />
-          <Text style={s.newOrderTitle}>New order received</Text>
-          <Text style={s.newOrderNo}>{order?.order_number}</Text>
-          <Text style={s.newOrderBody}>{order?.customer_name || 'Customer'} • {money(order?.total_amount)}</Text>
-          <Text style={s.newOrderHint}>Notifications will continue until this order is accepted or moved out of pending.</Text>
-          <Primary label="Open order" onPress={onOpen} />
-          <Secondary label="Later" onPress={onClose} />
-        </View>
+        <ScrollView style={s.newOrderModal} contentContainerStyle={{ alignItems: 'stretch', gap: 12, paddingBottom: 28 }} keyboardShouldPersistTaps="handled">
+          {order && !outcome && !rejected ? <SilenceBell orderId={order.id} /> : null}
+          <Image source={LOGO} style={[s.authLogo, { alignSelf: 'center' }]} resizeMode="contain" />
+          <Text style={[s.newOrderTitle, { textAlign: 'center' }]}>
+            {outcome === 'accepted' ? 'Order accepted' : rejected ? 'Order rejected' : 'New order received!'}
+          </Text>
+          <Text style={[s.newOrderNo, { textAlign: 'center' }]}>{order?.order_number}</Text>
+          <Text style={[s.newOrderBody, { textAlign: 'center' }]}>{who} • {bill ? money(bill) : 'Bill loading…'}</Text>
+          {order && isPrescription(order) ? <Text style={[s.rxBadge, { textAlign: 'center' }]}>Prescription order</Text> : null}
+          {rxLines.length ? (
+            <View style={s.extrasCard}>
+              {rxLines.map((line, idx) => (
+                <View key={`${line.label}-${idx}`} style={{ marginBottom: 8 }}>
+                  <Text style={s.kpiLabel}>{line.label}</Text>
+                  <Text style={s.infoValue}>{line.value}</Text>
+                </View>
+              ))}
+            </View>
+          ) : null}
+          {!outcome && !rejected ? <Text style={s.newOrderHint}>Tap the bell to silence this ring — same mute for prescription and normal orders.</Text> : null}
+          {decisions.map((a) => (
+            a.code === 'rejected' || a.code === 'wrong_prescription'
+              ? <Danger key={a.code} label={a.label} onPress={() => onAction(a.code)} />
+              : <Primary key={a.code} label={a.label} onPress={() => onAction(a.code)} />
+          ))}
+          {rejected ? (
+            <Secondary label="Close" onPress={onClose} />
+          ) : (
+            <View>
+              <Secondary label="View" onPress={onOpen} />
+              <Text style={[s.newOrderHint, { marginTop: 8 }]} onPress={onClose}>Later</Text>
+            </View>
+          )}
+        </ScrollView>
       </View>
     </Modal>
   );
@@ -2965,13 +3954,15 @@ function IntegrationsCard() {
 
 function BottomTabs({ current, setTab, pending }: { current: TabKey; setTab: (tab: TabKey) => void; pending: number }) {
   const insets = useSafeAreaInsets();
+  const { narrow } = useLayoutScale();
   const tabs: Array<[TabKey, string]> = [['home', 'Home'], ['orders', 'Orders'], ['catalog', 'Catalog'], ['stock', 'Stock'], ['more', 'More']];
+  const bottom = Math.max(insets.bottom, 8);
   return (
-    <View style={[s.tabs, { bottom: Math.max(insets.bottom, 10) }]}>
+    <View style={[s.tabs, { bottom: bottom, height: narrow ? 72 : 78, paddingBottom: Math.max(insets.bottom - 8, 0) }]}>
       {tabs.map(([key, label]) => (
         <TouchableOpacity key={key} style={[s.tab, current === key && s.tabActive]} onPress={() => setTab(key)} activeOpacity={0.85}>
           <AnimatedTabLogo source={TAB_LOGOS[key]} active={current === key} badge={key === 'orders' && pending > 0 ? (pending > 9 ? '9+' : String(pending)) : undefined} />
-          <Text style={[s.tabLabel, current === key && s.tabTextActive]}>{label}</Text>
+          <Text style={[s.tabLabel, current === key && s.tabTextActive]} numberOfLines={1}>{label}</Text>
         </TouchableOpacity>
       ))}
     </View>
@@ -3087,18 +4078,59 @@ function Kpi({ label, value, tone, onPress }: { label: string; value: string; to
 function SummaryTile({ label, value, onPress }: { label: string; value: string; onPress: () => void }) {
   return (
     <TouchableOpacity style={s.summaryTile} activeOpacity={0.82} onPress={onPress}>
-      <Text style={s.summaryLabel}>{label}</Text>
-      <Text style={s.summaryValue}>{value}</Text>
+      <Text style={s.summaryLabel} numberOfLines={1}>{label}</Text>
+      <Text style={s.summaryValue} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.7}>{value}</Text>
+    </TouchableOpacity>
+  );
+}
+
+function StatusHero({
+  label,
+  hint,
+  value,
+  tone,
+  onPress,
+}: {
+  label: string;
+  hint: string;
+  value: string;
+  tone: 'warm' | 'blue' | 'green';
+  onPress: () => void;
+}) {
+  const bg = tone === 'warm' ? C.yellowSoft : tone === 'green' ? C.greenSoft : C.blueSoft;
+  const fg = tone === 'warm' ? C.yellow : tone === 'green' ? C.green : C.blue;
+  return (
+    <TouchableOpacity style={[s.statusHero, { backgroundColor: bg }]} activeOpacity={0.85} onPress={onPress}>
+      <Text style={[s.statusHeroValue, { color: fg }]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.65}>{value}</Text>
+      <Text style={[s.statusHeroLabel, { color: fg }]} numberOfLines={2}>{label}</Text>
+      <Text style={s.statusHeroHint} numberOfLines={1}>{hint}</Text>
     </TouchableOpacity>
   );
 }
 
 function StatCard({ label, value, warm }: { label: string; value: string; warm?: boolean }) {
-  return <View style={[s.statCard, warm && { backgroundColor: C.yellowSoft }]}><Text style={s.kpiLabel}>{label}</Text><Text style={[s.statValue, warm && { color: C.yellow }]}>{value}</Text></View>;
+  return (
+    <View style={[s.statCard, warm && { backgroundColor: C.yellowSoft }]}>
+      <Text style={s.kpiLabel} numberOfLines={2}>{label}</Text>
+      <Text style={[s.statValue, warm && { color: C.yellow }]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.7}>{value}</Text>
+    </View>
+  );
 }
 
 function Info({ label, value }: { label: string; value: string }) {
   return <View style={{ marginBottom: 10 }}><Text style={s.kpiLabel}>{label}</Text><Text style={s.infoValue}>{value}</Text></View>;
+}
+
+function CustomerRxDetailsCard({ source }: { source: CustomerRxSource }) {
+  const lines = parseCustomerRxDetails(source);
+  if (!lines.length) return null;
+  return (
+    <View style={s.extrasCard}>
+      <Text style={s.itemTitle}>Customer extra Rx details</Text>
+      <Text style={s.muted}>Qty, doses and other notes sent with the prescription.</Text>
+      {lines.map((line, idx) => <Info key={`${line.label}-${idx}`} label={line.label} value={line.value} />)}
+    </View>
+  );
 }
 
 function MenuItem({ title, body, badge, onPress }: { title: string; body: string; badge?: string; onPress: () => void }) {
@@ -3120,8 +4152,15 @@ function IconButton({ label, onPress }: { label: string; onPress: () => void }) 
 }
 
 function OrderStepper({ status }: { status: string }) {
-  const steps = ['New', 'Confirmed', 'Preparing', 'Ready'];
-  const normalized = status === 'ready_for_pickup' ? 'Ready' : status === 'preparing' ? 'Preparing' : status === 'confirmed' ? 'Confirmed' : 'New';
+  const steps = ['Pending', 'Confirmed', 'Preparing', 'Ready'];
+  const st = (status || '').toLowerCase();
+  const normalized = ['ready_for_pickup', 'assigned', 'picked_up', 'out_for_delivery', 'delivered', 'completed'].includes(st)
+    ? 'Ready'
+    : st === 'preparing' || st === 'partial_forward'
+      ? 'Preparing'
+      : st === 'confirmed'
+        ? 'Confirmed'
+        : 'Pending';
   const current = Math.max(0, steps.indexOf(normalized));
   return <View style={s.stepper}>{steps.map((step, idx) => <View key={step} style={s.step}><Text style={[s.stepDot, idx <= current && { color: C.orange }]}>●</Text><Text style={s.stepText}>{step}</Text></View>)}</View>;
 }
@@ -3174,10 +4213,21 @@ const s = StyleSheet.create({
   headerLogo: { width: 44, height: 44, borderRadius: 14, backgroundColor: C.teal },
   headerTitle: { color: C.ink, fontWeight: '900', fontSize: 22 },
   headerSub: { color: C.muted, marginTop: 3, fontSize: 12 },
-  iconButton: { width: 40, height: 40, borderRadius: 14, backgroundColor: C.tealSoft, alignItems: 'center', justifyContent: 'center' },
+  iconButton: { width: 40, height: 40, borderRadius: 14, backgroundColor: C.tealSoft, alignItems: 'center', justifyContent: 'center', position: 'relative' },
+  headerNotifBadge: { position: 'absolute', right: -4, top: -4, minWidth: 18, height: 18, borderRadius: 9, backgroundColor: C.redAccent, color: '#FFF', fontWeight: '900', textAlign: 'center', overflow: 'hidden', fontSize: 10, lineHeight: 18, paddingHorizontal: 3 },
+  notifCardUnread: { backgroundColor: '#E5E7EB', borderColor: '#CBD5E1' },
+  notifCardRead: { backgroundColor: '#FFFFFF' },
+  notifMarkHint: { color: C.muted, fontSize: 11, fontWeight: '800' },
+  moreTileBadge: { position: 'absolute', right: 10, top: 10, minWidth: 18, height: 18, borderRadius: 9, backgroundColor: C.redAccent, color: '#FFF', fontWeight: '900', textAlign: 'center', overflow: 'hidden', fontSize: 10, lineHeight: 18, paddingHorizontal: 3 },
   iconText: { color: C.muted, fontSize: 22, fontWeight: '900' },
-  body: { paddingHorizontal: 18, paddingBottom: 128, gap: 14 },
-  dashboardCard: { backgroundColor: '#FFF', borderRadius: 22, borderWidth: 1, borderColor: C.line, padding: 18, gap: 16, shadowColor: C.teal, shadowOpacity: 0.08, shadowRadius: 18, shadowOffset: { width: 0, height: 10 }, elevation: 3 },
+  body: { paddingHorizontal: 16, paddingBottom: 128, gap: 14 },
+  dashboardCard: { backgroundColor: '#FFF', borderRadius: 22, borderWidth: 1, borderColor: C.line, padding: 16, gap: 14, shadowColor: C.teal, shadowOpacity: 0.08, shadowRadius: 18, shadowOffset: { width: 0, height: 10 }, elevation: 3 },
+  dashSectionLabel: { color: C.muted, fontSize: 12, fontWeight: '800', textTransform: 'uppercase', letterSpacing: 0.4, marginTop: 2 },
+  statusStrip: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  statusHero: { flexGrow: 1, flexBasis: '30%', minWidth: 96, maxWidth: '100%', borderRadius: 16, paddingVertical: 12, paddingHorizontal: 10, gap: 2 },
+  statusHeroValue: { fontSize: 28, fontWeight: '900', lineHeight: 32 },
+  statusHeroLabel: { fontSize: 12, fontWeight: '800', lineHeight: 16 },
+  statusHeroHint: { color: C.muted, fontSize: 11, lineHeight: 14, marginTop: 2 },
   card: { backgroundColor: '#FFF', borderRadius: 18, borderWidth: 1, borderColor: C.line, padding: 16, gap: 10, shadowColor: '#0F766E', shadowOpacity: 0.04, shadowRadius: 10, shadowOffset: { width: 0, height: 4 }, elevation: 1 },
   rowBetween: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: 12 },
   bigTitle: { color: C.ink, fontWeight: '900', fontSize: 20 },
@@ -3194,7 +4244,7 @@ const s = StyleSheet.create({
   storeToggleBody: { fontSize: 12, marginTop: 4 },
   storeToggleAction: { fontSize: 14, fontWeight: '900' },
   summaryGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
-  summaryTile: { width: '47.9%', minHeight: 70, borderRadius: 14, borderWidth: 1, borderColor: C.line, backgroundColor: C.surface, padding: 12, justifyContent: 'center' },
+  summaryTile: { flexGrow: 1, flexBasis: '46%', minWidth: 140, minHeight: 70, borderRadius: 14, borderWidth: 1, borderColor: C.line, backgroundColor: C.surface, padding: 12, justifyContent: 'center' },
   summaryLabel: { color: C.muted, fontSize: 11, fontWeight: '900' },
   summaryValue: { color: C.ink, fontSize: 21, fontWeight: '900', marginTop: 5 },
   infoCard: { borderRadius: 16, padding: 16 },
@@ -3225,8 +4275,8 @@ const s = StyleSheet.create({
   segmentDark: { backgroundColor: C.ink },
   segmentText: { color: C.muted, fontSize: 12, fontWeight: '900' },
   count: { color: C.muted, fontSize: 14, fontWeight: '800' },
-  statRow: { flexDirection: 'row', gap: 18 },
-  statCard: { flex: 1, backgroundColor: '#FFF', borderRadius: 16, borderWidth: 1, borderColor: C.line, padding: 16, minHeight: 82 },
+  statRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
+  statCard: { flexGrow: 1, flexBasis: '46%', minWidth: 140, backgroundColor: '#FFF', borderRadius: 16, borderWidth: 1, borderColor: C.line, padding: 14, minHeight: 82 },
   statValue: { color: C.ink, fontWeight: '900', fontSize: 28, marginTop: 8 },
   smallChip: { alignSelf: 'flex-start', paddingHorizontal: 14, height: 30, borderRadius: 18, backgroundColor: C.beige, justifyContent: 'center' },
   smallChipText: { color: C.muted, fontWeight: '900', fontSize: 12 },
@@ -3263,10 +4313,17 @@ const s = StyleSheet.create({
   rxImage: { height: 250, backgroundColor: '#FFF', borderRadius: 16, borderWidth: 1, borderColor: C.line },
   tapHint: { color: C.muted, textAlign: 'center', fontSize: 12, marginTop: 8 },
   suggestionRow: { borderRadius: 14, borderWidth: 1, borderColor: C.line, backgroundColor: C.beige, padding: 12, flexDirection: 'row', alignItems: 'center', gap: 10 },
-  imageViewer: { flex: 1, backgroundColor: '#000', alignItems: 'center', justifyContent: 'center' },
-  imageClose: { position: 'absolute', top: 44, right: 18, zIndex: 2, minHeight: 42, borderRadius: 22, backgroundColor: 'rgba(255,255,255,0.92)', paddingHorizontal: 18, alignItems: 'center', justifyContent: 'center' },
+  imageViewer: { flex: 1, backgroundColor: '#000' },
+  imageClose: { minHeight: 42, borderRadius: 22, backgroundColor: 'rgba(255,255,255,0.92)', paddingHorizontal: 18, alignItems: 'center', justifyContent: 'center' },
   imageCloseText: { color: C.ink, fontWeight: '900' },
   fullRxImage: { width: '100%', height: '100%' },
+  rxViewerTop: { paddingHorizontal: 16, paddingVertical: 8, alignItems: 'flex-end' },
+  rxViewerStage: { flex: 1, alignItems: 'center', justifyContent: 'center', overflow: 'hidden' },
+  rxViewerTools: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, justifyContent: 'center', paddingHorizontal: 12, paddingTop: 8 },
+  rxToolBtn: { minHeight: 42, borderRadius: 21, backgroundColor: 'rgba(255,255,255,0.92)', paddingHorizontal: 16, alignItems: 'center', justifyContent: 'center' },
+  rxToolText: { color: C.ink, fontWeight: '900', fontSize: 13 },
+  extrasCard: { backgroundColor: '#FFF7ED', borderRadius: 16, borderWidth: 1, borderColor: '#F3D6B8', padding: 14, gap: 4 },
+  rxExtrasPreview: { color: C.orangeDark, fontSize: 12, fontWeight: '700', lineHeight: 17, marginTop: 6 },
   virtualBanner: { backgroundColor: '#FFF7ED', borderRadius: 14, padding: 12 },
   virtualTitle: { color: C.orangeDark, fontWeight: '900', fontSize: 13 },
   virtualText: { color: C.yellow, fontSize: 12, marginTop: 4 },
@@ -3274,7 +4331,7 @@ const s = StyleSheet.create({
   step: { alignItems: 'center', flex: 1 },
   stepDot: { color: C.muted, fontSize: 18 },
   stepText: { color: C.muted, fontSize: 11, fontWeight: '800', marginTop: 4 },
-  tabs: { position: 'absolute', left: 12, right: 12, bottom: 10, height: 78, backgroundColor: '#FFFFFF', borderRadius: 28, borderWidth: 1, borderColor: '#E3EEEC', flexDirection: 'row', justifyContent: 'space-around', alignItems: 'center', paddingHorizontal: 6, shadowColor: '#0F766E', shadowOpacity: 0.16, shadowRadius: 18, shadowOffset: { width: 0, height: 8 }, elevation: 14 },
+  tabs: { position: 'absolute', left: 8, right: 8, bottom: 10, height: 78, backgroundColor: '#FFFFFF', borderRadius: 24, borderWidth: 1, borderColor: '#E3EEEC', flexDirection: 'row', justifyContent: 'space-around', alignItems: 'center', paddingHorizontal: 4, shadowColor: '#0F766E', shadowOpacity: 0.16, shadowRadius: 18, shadowOffset: { width: 0, height: 8 }, elevation: 14 },
   tab: { minWidth: 60, height: 66, borderRadius: 22, alignItems: 'center', justifyContent: 'center' },
   tabActive: { backgroundColor: C.tealSoft },
   tabLogo: { width: 36, height: 36, borderRadius: 18, alignItems: 'center', justifyContent: 'center', backgroundColor: '#F4FAF9', overflow: 'hidden' },
@@ -3284,15 +4341,18 @@ const s = StyleSheet.create({
   tabLabel: { color: C.muted, fontSize: 11, fontWeight: '800', marginTop: 3 },
   tabTextActive: { color: C.teal },
   badge: { position: 'absolute', right: -8, top: -6, minWidth: 18, height: 18, borderRadius: 9, backgroundColor: C.redAccent, color: '#FFF', fontWeight: '900', textAlign: 'center', overflow: 'hidden', fontSize: 10, lineHeight: 18 },
-  modalShade: { flex: 1, backgroundColor: 'rgba(0,0,0,0.36)', justifyContent: 'center', padding: 22 },
+  modalShade: { flex: 1, backgroundColor: 'rgba(18,49,47,0.82)', justifyContent: 'center', paddingHorizontal: 18, paddingVertical: 36 },
   modalCard: { backgroundColor: C.bg, borderRadius: 22, padding: 20, gap: 12 },
-  newOrderModal: { backgroundColor: C.bg, borderRadius: 24, padding: 22, gap: 12, alignItems: 'center' },
+  newOrderModal: { backgroundColor: C.bg, borderRadius: 24, padding: 22, gap: 12, alignItems: 'center', maxHeight: '90%', width: '100%' },
+  popupBellButton: { alignItems: 'center', justifyContent: 'center', paddingVertical: 4, gap: 2 },
+  popupBell: { fontSize: 36, lineHeight: 42 },
+  popupBellHint: { color: C.muted, fontSize: 11, fontWeight: '700' },
   newOrderTitle: { color: C.orange, fontSize: 18, fontWeight: '900', marginTop: 4 },
   newOrderNo: { color: C.ink, fontSize: 24, fontWeight: '900' },
   newOrderBody: { color: C.ink, fontSize: 16, fontWeight: '800' },
   newOrderHint: { color: C.muted, fontSize: 12, textAlign: 'center', lineHeight: 18, marginBottom: 4 },
   moreGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
-  moreTile: { width: '47.8%', minHeight: 108, borderRadius: 20, backgroundColor: '#FFF', borderWidth: 1, borderColor: C.line, padding: 14, justifyContent: 'flex-start', shadowColor: C.teal, shadowOpacity: 0.05, shadowRadius: 8, shadowOffset: { width: 0, height: 4 }, elevation: 1 },
+  moreTile: { flexGrow: 1, flexBasis: '46%', minWidth: 140, minHeight: 108, borderRadius: 20, backgroundColor: '#FFF', borderWidth: 1, borderColor: C.line, padding: 14, justifyContent: 'flex-start', shadowColor: C.teal, shadowOpacity: 0.05, shadowRadius: 8, shadowOffset: { width: 0, height: 4 }, elevation: 1, position: 'relative' },
   moreTileIcon: { fontSize: 22, marginBottom: 8 },
   moreTileTitle: { color: C.ink, fontSize: 15, fontWeight: '900' },
   moreTileBody: { color: C.muted, fontSize: 12, lineHeight: 16, marginTop: 4 },
